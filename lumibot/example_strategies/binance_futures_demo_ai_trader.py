@@ -6190,12 +6190,12 @@ def _run_iteration(
             return state
 
         # Trend Coherence Guard
-        if getattr(args, "trend_coherence_guard", False):
+        if getattr(args, "trend_coherence_guard", False) and regime.name == "trending":
             coherence_tf = getattr(args, "trend_coherence_timeframe", "1h")
             if coherence_tf in timeframe_indicators:
                 tf_ind = timeframe_indicators[coherence_tf]
                 if indicators.trend != "flat" and tf_ind.trend != "flat" and indicators.trend != tf_ind.trend:
-                    reason = f"trend coherence mismatch: primary({args.timeframe})={indicators.trend} vs {coherence_tf}={tf_ind.trend}"
+                    reason = f"trend coherence mismatch in trending market: primary({args.timeframe})={indicators.trend} vs {coherence_tf}={tf_ind.trend}"
                     print(f"Blocked: {reason}.")
                     _record_entry_block(state, symbol, "trend_coherence", reason)
                     return state
