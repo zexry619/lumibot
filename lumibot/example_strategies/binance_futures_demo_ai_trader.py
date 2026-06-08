@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import time
+import sqlite3
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -92,6 +93,9 @@ RUNTIME_CONFIG_HOT_KEYS = {
     "emergency_close_positions",
     "allow_short",
     "allow_fallback",
+    "trend_coherence_guard",
+    "trend_coherence_timeframe",
+    "adversarial_debate",
     "models",
     "model",
     "advisor_models",
@@ -1124,7 +1128,7 @@ def _decision_prompt(
             "if it is still clearly the best opportunity after risk and execution review. "
             "Use context.execution_context, context.risk_context, context.exit_plan_preview, "
             "context.performance_context, context.market_structure, context.market_breadth, "
-            "context.entry_block_context, and context.exchange_sentiment_context (if available) "
+            "context.entry_block_context, context.adversarial_debate (if active), and context.exchange_sentiment_context (if available) "
             "to judge whether the setup is worth taking now. "
             "current_position.has_position=false means the account is flat for this symbol; it is valid market data, "
             "not a missing or null input. "
@@ -1277,6 +1281,44 @@ def _effective_multi_agent_decision(decision: MultiAgentDecision) -> EffectiveDe
     return EffectiveDecision(decision.final)
 
 
+def _bull_case_prompt(prompt: dict[str, Any]) -> dict[str, Any]:
+    bull_prompt = dict(prompt)
+    bull_prompt["role"] = "You are a highly biased crypto Bull Analyst."
+    bull_prompt["task"] = (
+        "Your sole task is to build the strongest possible BUY (Long) case for the selected symbol based on the provided indicators and timeframe data. "
+        "Ignore the bearish signals or explain why they are irrelevant. Highlight support levels, bullish EMA setups, oversold RSI levels, and breakout opportunities. "
+        "Return only JSON with keys: bull_thesis (string), bull_confidence (0.0 to 1.0), and key_buy_levels (list of strings). "
+        "Do not wrap in markdown or add prose."
+    )
+    bull_prompt = dict(bull_prompt)
+    bull_prompt.pop("recent_reviews", None)
+    if "context" in bull_prompt and isinstance(bull_prompt["context"], dict):
+        bull_prompt["context"] = {
+            "market_structure": bull_prompt["context"].get("market_structure"),
+            "exit_plan_preview": bull_prompt["context"].get("exit_plan_preview"),
+        }
+    return bull_prompt
+
+
+def _bear_case_prompt(prompt: dict[str, Any]) -> dict[str, Any]:
+    bear_prompt = dict(prompt)
+    bear_prompt["role"] = "You are a highly biased crypto Bear Analyst."
+    bear_prompt["task"] = (
+        "Your sole task is to build the strongest possible SELL (Short) or HOLD case for the selected symbol based on the provided indicators and timeframe data. "
+        "Ignore the bullish signals or explain why they are irrelevant. Highlight resistance levels, bearish EMA setups, overbought RSI levels, volatility risks, and liquidity issues. "
+        "Return only JSON with keys: bear_thesis (string), bear_confidence (0.0 to 1.0), and key_sell_levels (list of strings). "
+        "Do not wrap in markdown or add prose."
+    )
+    bear_prompt = dict(bear_prompt)
+    bear_prompt.pop("recent_reviews", None)
+    if "context" in bear_prompt and isinstance(bear_prompt["context"], dict):
+        bear_prompt["context"] = {
+            "market_structure": bear_prompt["context"].get("market_structure"),
+            "exit_plan_preview": bear_prompt["context"].get("exit_plan_preview"),
+        }
+    return bear_prompt
+
+
 def _gemini_decision(
     models: list[str] | str,
     indicators: Indicators,
@@ -1292,7 +1334,12 @@ def _gemini_decision(
     request_timeout_seconds: float = 180.0,
     entry_aggressiveness: Decimal = Decimal("0.50"),
     context_payload: dict[str, Any] | None = None,
+    adversarial_debate: bool = False,
 ) -> MultiAgentDecision:
+    model_chain = [models] if isinstance(models, str) else list(models)
+    if not model_chain:
+        model_chain = [DEFAULT_MODEL]
+
     prompt = _decision_prompt(
         indicators,
         position,
@@ -1305,10 +1352,40 @@ def _gemini_decision(
         entry_aggressiveness,
         context_payload,
     )
+
+    if adversarial_debate and position is None:
+        try:
+            print("Adversarial Debate active: generating Bull and Bear theses...")
+            spec = _parse_model_spec(model_chain[0])
+            display_name = _model_display_name(spec)
+            
+            bull_prompt = _bull_case_prompt(prompt)
+            bear_prompt = _bear_case_prompt(prompt)
+            
+            bull_text = _ai_completion_text(spec, bull_prompt, temperature=0.2, max_output_tokens=300, timeout_seconds=request_timeout_seconds)
+            bear_text = _ai_completion_text(spec, bear_prompt, temperature=0.2, max_output_tokens=300, timeout_seconds=request_timeout_seconds)
+            
+            try:
+                bull_json = json.loads(_strip_json_fence(bull_text))
+            except Exception:
+                bull_json = {"bull_thesis": bull_text, "bull_confidence": 0.5}
+                
+            try:
+                bear_json = json.loads(_strip_json_fence(bear_text))
+            except Exception:
+                bear_json = {"bear_thesis": bear_text, "bear_confidence": 0.5}
+                
+            if "context" not in prompt:
+                prompt["context"] = {}
+            prompt["context"]["adversarial_debate"] = {
+                "bull_case": bull_json,
+                "bear_case": bear_json
+            }
+            print(f"Adversarial Debate generated. Bull confidence: {bull_json.get('bull_confidence')}, Bear confidence: {bear_json.get('bear_confidence')}")
+        except Exception as e:
+            print(f"Failed to generate adversarial debate: {e}; continuing with default prompt.")
+
     attempts = max(1, max_retries + 1)
-    model_chain = [models] if isinstance(models, str) else list(models)
-    if not model_chain:
-        model_chain = [DEFAULT_MODEL]
     failures: list[str] = []
     for model_name in model_chain:
         spec = _parse_model_spec(model_name)
@@ -1648,6 +1725,91 @@ def _gemini_trade_review(
         "lesson": str(payload.get("lesson", ""))[:500],
         "next_adjustment": str(payload.get("next_adjustment", ""))[:500],
     }
+
+
+def _init_lessons_db(db_path: str = "data/binance_futures_demo_ai_trader_lessons.db") -> None:
+    try:
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trade_lessons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                exit_reason TEXT,
+                side TEXT,
+                quality TEXT,
+                lesson TEXT,
+                next_adjustment TEXT,
+                pnl_pct REAL,
+                regime TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error initializing lessons database: {e}")
+
+
+def _save_lesson_to_db(review: dict[str, Any], db_path: str = "data/binance_futures_demo_ai_trader_lessons.db") -> None:
+    try:
+        _init_lessons_db(db_path)
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO trade_lessons (symbol, exit_reason, side, quality, lesson, next_adjustment, pnl_pct, regime, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            review.get("symbol"),
+            review.get("exit_reason"),
+            review.get("side"),
+            review.get("quality"),
+            review.get("lesson"),
+            review.get("next_adjustment"),
+            float(review.get("pnl_pct", 0.0)),
+            review.get("regime"),
+            datetime.now(timezone.utc).isoformat()
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error saving lesson to database: {e}")
+
+
+def _query_relevant_lessons(symbol: str, regime: str, limit: int = 5, db_path: str = "data/binance_futures_demo_ai_trader_lessons.db") -> list[dict[str, Any]]:
+    lessons = []
+    try:
+        if not os.path.exists(db_path):
+            return lessons
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT symbol, exit_reason, side, quality, lesson, next_adjustment, pnl_pct, regime, timestamp
+            FROM trade_lessons
+            WHERE symbol = ? OR regime = ?
+            ORDER BY (symbol = ?) DESC, timestamp DESC
+            LIMIT ?
+        """, (symbol, regime, symbol, limit))
+        rows = cursor.fetchall()
+        for row in rows:
+            lessons.append({
+                "symbol": row[0],
+                "exit_reason": row[1],
+                "side": row[2],
+                "quality": row[3],
+                "lesson": row[4],
+                "next_adjustment": row[5],
+                "pnl_pct": row[6],
+                "regime": row[7],
+                "reviewed_at": row[8]
+            })
+        conn.close()
+    except Exception as e:
+        print(f"Error querying lessons database: {e}")
+    return lessons
 
 
 def _load_state(path: Path) -> dict[str, Any]:
@@ -5351,6 +5513,19 @@ def _review_closed_trade(
     else:
         pnl_pct = (position.entry_price - exit_price) / position.entry_price * Decimal("100")
 
+    # Save to SQLite lessons database
+    db_review = {
+        "symbol": symbol,
+        "exit_reason": exit_reason,
+        "side": position.side,
+        "quality": review.get("quality", "mixed"),
+        "lesson": review.get("lesson", ""),
+        "next_adjustment": review.get("next_adjustment", ""),
+        "pnl_pct": float(pnl_pct),
+        "regime": open_trade.get("entry_regime", "unknown")
+    }
+    _save_lesson_to_db(db_review, getattr(args, "lessons_db_path", "data/binance_futures_demo_ai_trader_lessons.db"))
+
     if pnl_pct < 0 or review.get("quality") == "bad":
         overrides = state.setdefault("lessons_learned_overrides", {})
 
@@ -6014,7 +6189,25 @@ def _run_iteration(
             _record_entry_block(state, symbol, "account_position", account_position_block)
             return state
 
+        # Trend Coherence Guard
+        if getattr(args, "trend_coherence_guard", False):
+            coherence_tf = getattr(args, "trend_coherence_timeframe", "1h")
+            if coherence_tf in timeframe_indicators:
+                tf_ind = timeframe_indicators[coherence_tf]
+                if indicators.trend != "flat" and tf_ind.trend != "flat" and indicators.trend != tf_ind.trend:
+                    reason = f"trend coherence mismatch: primary({args.timeframe})={indicators.trend} vs {coherence_tf}={tf_ind.trend}"
+                    print(f"Blocked: {reason}.")
+                    _record_entry_block(state, symbol, "trend_coherence", reason)
+                    return state
+
     recent_reviews = state.get("trade_reviews", []) if isinstance(state.get("trade_reviews"), list) else []
+    db_path = getattr(args, "lessons_db_path", "data/binance_futures_demo_ai_trader_lessons.db")
+    sqlite_lessons = _query_relevant_lessons(symbol, regime.name, limit=5, db_path=db_path)
+    combined_reviews = list(recent_reviews)
+    for lesson in sqlite_lessons:
+        if not any(r.get("reviewed_at") == lesson.get("reviewed_at") for r in combined_reviews):
+            combined_reviews.append(lesson)
+    recent_reviews = combined_reviews
 
     # Decision Log Cooldown Check
     if position is None:
@@ -6075,6 +6268,7 @@ def _run_iteration(
             getattr(args, "ai_request_timeout_seconds", 180.0),
             getattr(args, "ai_entry_aggressiveness", Decimal("0.50")),
             ai_context,
+            adversarial_debate=getattr(args, "adversarial_debate", False),
         )
     except Exception as exc:
         if args.allow_fallback:
@@ -6353,6 +6547,7 @@ def _run_iteration(
             "trailing_armed": False,
             "exit_plan": _exit_plan_to_state(exit_plan),
             "native_protection": protection,
+            "entry_regime": regime.name,
             "entry_decision": {
                 "action": decision.action,
                 "confidence": str(decision.confidence),
@@ -6473,6 +6668,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--timeframe", default="5m")
     parser.add_argument("--analysis-timeframes", default="1m,5m,15m,1h")
+    parser.add_argument(
+        "--trend-coherence-guard",
+        action="store_true",
+        help="Block entries when primary trend mismatches the longer coherence timeframe trend."
+    )
+    parser.add_argument("--trend-coherence-timeframe", default="1h", help="Timeframe for trend coherence checks (default 1h).")
+    parser.add_argument(
+        "--adversarial-debate",
+        action="store_true",
+        help="Enable adversarial debate mode where separate Bull and Bear analyst models run before the final model."
+    )
     parser.add_argument("--candle-limit", type=int, default=200)
     parser.add_argument("--mtf-candle-limit", type=int, default=200)
     parser.add_argument(
@@ -6716,6 +6922,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--interval-seconds", type=float, default=300)
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
+    parser.add_argument("--lessons-db-path", default="data/binance_futures_demo_ai_trader_lessons.db", help="Path to SQLite lessons database.")
     parser.add_argument(
         "--lock-file",
         type=Path,

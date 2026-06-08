@@ -100,6 +100,10 @@
     "auto_tune_idle_reward_fee_step": "0.25",
     "auto_tune_idle_max_entry_funding_cost_pct": "0.08",
     "auto_tune_idle_funding_step_pct": "0.01",
-    "notify_events": "entry,exit,risk,performance,health"
+    "notify_events": "entry,exit,risk,performance,health",
+    "trend_coherence_guard": true,
+    "trend_coherence_timeframe": "1h",
+    "adversarial_debate": true,
+    "lessons_db_path": "data/binance_futures_demo_ai_trader_lessons.db"
   }
 }
