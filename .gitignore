@@ -60,8 +60,17 @@ data/SRNE_Minute.csv
 .vscode/**
 *.tmp
 .env
+*.env
+*.env.*
+*.key
+*.pem
+*creds*.json
+*credential*.json
+*token*.json
 token.json
 schwab_token.json
+.secrets/*
+!.secrets/lumi_secrets.env.example
 
 # AI assistant instruction files (contain local paths)
 CLAUDE.md
