@@ -487,6 +487,11 @@ def _stale_position_action(
 
 def _strip_json_fence(text: str) -> str:
     value = text.strip()
+    # Remove <think>...</think> tags if present
+    if "<think>" in value:
+        parts = value.split("</think>", 1)
+        if len(parts) > 1:
+            value = parts[1].strip()
     if value.startswith("```"):
         value = value.removeprefix("```json").removeprefix("```").strip()
         if value.endswith("```"):
