@@ -93,3 +93,6 @@ context*.json
 
 # Local scratch / diagnostics (never commit)
 tmp/
+# Bot State and lock files
+data/*.lock
+data/*_state.json*

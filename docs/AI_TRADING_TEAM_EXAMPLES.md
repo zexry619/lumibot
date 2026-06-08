@@ -42,6 +42,11 @@ affiliated with or endorsed by the investors, firms, or companies named.
   The same bull/bear debate structure applied to familiar large-cap stocks, so
   the reasoning is easier to inspect before using more volatile instruments.
 
+- `examples/adaptive_ai_trading_team_example.py`
+  An adaptive AI trading team that implements key concepts from the Meridian Solana agent:
+  structured decision logging to avoid redundant LLM calls, threshold evolution based on
+  lessons learned from past trades, and gated execution with specialist roles.
+
 ## Run the examples
 
 Each example defaults to broker-connected execution. With Alpaca, it runs in

@@ -314,6 +314,7 @@ DISCORD_WEBHOOK_URL
 
 - Purpose: Discord webhook URL for notifications.
 - Values: Full Discord webhook URL (**do not hardcode in public repos**).
+- Notes: Also used by the Binance futures AI trader when ``--notify-events`` is set.
 
 Database configuration
 ----------------------
@@ -574,6 +575,29 @@ COINBASE_SANDBOX
 - Values: ``true`` / ``false``.
 - Default: ``false``.
 
+BINANCE_FUTURES_DEMO_API_KEY / BINANCE_FUTURES_DEMO_API_SECRET
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Binance USD-M Futures demo trading credentials for the standalone
+  ``binance_futures_testnet_smoke.py`` validation script and guarded
+  ``binance_futures_demo_ai_trader.py`` example.
+- Values: Obtain from Binance Futures demo trading (**do not hardcode**).
+- Notes: These variables are intentionally demo-specific. Do not reuse live
+  Binance API keys for the futures demo smoke test. The script also accepts the
+  legacy ``BINANCE_FUTURES_TESTNET_API_KEY`` and
+  ``BINANCE_FUTURES_TESTNET_API_SECRET`` names for local compatibility, but new
+  setups should prefer the ``DEMO`` names.
+
+BINANCE_FUTURES_LIVE_API_KEY / BINANCE_FUTURES_LIVE_API_SECRET
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Binance USD-M Futures live trading credentials for
+  ``binance_futures_demo_ai_trader.py --environment live``.
+- Values: Obtain from Binance Futures live API management (**do not hardcode**).
+- Notes: Keep these separate from demo credentials. The example requires
+  ``--live-confirm I_UNDERSTAND_LIVE_RISK`` before live execution is allowed.
+  Validate dry-run and demo execution before using live credentials.
+
 Bitunix broker
 --------------
 
@@ -726,6 +750,52 @@ OPENAI_API_KEY
 - Values: Obtain from https://platform.openai.com/api-keys.
 - Required when ``default_model`` looks like ``openai/gpt-5.4-mini`` or any other ``openai/...`` id.
 
+OPENAI_COMPATIBLE_BASE_URL / OPENAI_BASE_URL
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: OpenAI-compatible Chat Completions endpoint for the Binance futures
+  AI trader when ``--models``, ``--advisor-models``, or ``--shadow-models``
+  includes ``openai:<model>`` or ``openai-compatible:<model>``.
+- Values: Base URL ending at the OpenAI-compatible API root, for example
+  ``http://localhost:8083/v1`` or ``https://<provider-host>/v1``.
+- Notes: ``OPENAI_COMPATIBLE_BASE_URL`` is preferred for the Binance futures
+  trader. ``OPENAI_BASE_URL`` is accepted for OpenAI SDK compatibility. The
+  first entry in ``--models`` is the primary provider/model. Advisor models are
+  added to final-model context, while shadow models run after the final
+  decision; neither drives orders directly. Use the separate ``qwen:`` prefix
+  and Qwen variables when a Qwen OpenAI-compatible bridge is running beside a
+  Gemini OpenAI-compatible bridge.
+
+OPENAI_COMPATIBLE_API_KEY
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: API key for the OpenAI-compatible endpoint used by Binance futures
+  AI trader execution or shadow comparison models.
+- Values: Provider key (**do not hardcode**).
+- Notes: Local no-auth endpoints on ``localhost``, ``127.0.0.1``, or ``[::1]``
+  can omit this key; the trader supplies a dummy key internally because the
+  OpenAI SDK requires one. Hosted providers should set this variable. Plain
+  OpenAI usage can use ``OPENAI_API_KEY``.
+
+QWEN_OPENAI_COMPATIBLE_BASE_URL / QWEN_OPENAI_BASE_URL
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Separate Qwen OpenAI-compatible Chat Completions endpoint for the
+  Binance futures AI trader when ``--advisor-models`` or ``--shadow-models``
+  includes ``qwen:<model>``.
+- Values: Base URL ending at the OpenAI-compatible API root, for example
+  ``http://127.0.0.1:7860/v1``.
+- Notes: This is intentionally separate from ``OPENAI_COMPATIBLE_BASE_URL`` so
+  a Gemini OpenAI-compatible bridge and a Qwen bridge can run side by side.
+  Qwen requests automatically include ``enable_thinking=false``.
+
+QWEN_OPENAI_COMPATIBLE_API_KEY / QWEN_API_KEY
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: API key for the Qwen OpenAI-compatible endpoint used by ``qwen:``
+  advisor or shadow models.
+- Values: Provider/local bridge key (**do not hardcode**).
+
 XAI_API_KEY or GROK_API_KEY
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -825,9 +895,11 @@ TELEGRAM_BOT_TOKEN
 
 - Purpose: Telegram Bot API token for ``self.notifications.configure_telegram()``.
 - Values: Bot token from BotFather.
+- Notes: Also used by the Binance futures AI trader when ``--notify-events`` is set.
 
 TELEGRAM_CHAT_ID
 ^^^^^^^^^^^^^^^^
 
 - Purpose: Telegram chat/channel/user id for strategy notifications.
 - Values: Telegram chat id.
+- Notes: Also used by the Binance futures AI trader when ``--notify-events`` is set.

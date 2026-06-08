@@ -24,9 +24,13 @@ Deploy marker: `e51a0478`
 ### Added
 - **AI agent model calls now have provider-level request timeouts.** Native Gemini requests pass a Google GenAI HTTP timeout and LiteLLM-backed providers pass a LiteLLM completion timeout, preventing one stalled model request from freezing a strategy for the full agent-run budget.
 - **AI agent timeout settings are configurable from strategy code.** `self.agents.create(...)` and `agent.run(...)` now accept `model_request_timeout_seconds` and `run_timeout_seconds`, with documented defaults of 600 seconds per model request and 1800 seconds for the whole agent run.
+- **Binance futures AI trader now supports advisor and shadow model comparisons.** `--advisor-models` can run models such as `qwen:qwen3.7-max-thinking` before Gemini and feed the second opinion into final-model context, while `--shadow-models` remains a passive after-final audit path; `--models` is still the only direct execution decision source. The `qwen:` prefix has its own OpenAI-compatible endpoint variables so it can run beside a Gemini OpenAI-compatible bridge.
+- **Binance futures AI trader now supports capped multi-symbol exposure.** `--max-open-positions` and `--max-new-entries-per-cycle` let the demo manage all existing positions first, then scan flat symbols for a bounded new entry while still blocking same-symbol pyramiding and enforcing aggregate notional caps.
+- **Binance futures AI trader now supports Meridian-inspired features.** Added `--ai-decision-cooldown-minutes` to skip LLM calls if last decision was HOLD. Added `--stale-position-hold-minutes` and `--stale-position-min-pnl-pct` to exit stale consolidating positions (similar to Meridian's Out of Range Wait). Added Partial Take Profit support (executes a 50% partial close at 50% of the take-profit target and tightens the remaining stop-loss to breakeven). Added Lessons Learned & Threshold Evolution to automatically adjust confidence and stop-loss thresholds after losing closes.
 
 ### Fixed
 - **Agent runtime traces now log the effective timeout settings and first ADK event latency.** This makes it clear whether a run is stuck waiting on the model provider or actively making progress through ADK/tool events.
+- **Binance futures AI responses now tolerate provider agent maps.** The decision parser accepts `agents` as either the requested array or a provider-returned object map, reducing needless retries when OpenAI-compatible models return valid committee members in map form.
 
 ## 4.5.44 - Unreleased
 

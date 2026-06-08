@@ -101,7 +101,7 @@ class Ccxt(Broker):
         balances = self._fetch_balance()
 
         currency_key = "currency"
-        if self.api.exchangeId in ["coinbasepro", "kucoin", "kraken", "coinbase", "binance", "bitmex", "weex"]:
+        if self.api.exchangeId in ["coinbasepro", "kucoin", "kraken", "coinbase", "binance", "bitmex", "weex", "okx"]:
             balances_info = []
             reserved_keys = ["total", "free", "used", "info", "timestamp", "datetime", "debt"]
             for key in balances:
@@ -221,7 +221,7 @@ class Ccxt(Broker):
         """Get the broker representation of all positions"""
         response = self._fetch_balance()
 
-        if self.api.exchangeId in ["kraken", "kucoin", "coinbasepro", "coinbase", "binance", "bitmex", "weex"]:
+        if self.api.exchangeId in ["kraken", "kucoin", "coinbasepro", "coinbase", "binance", "bitmex", "weex", "okx"]:
             balances_info = []
             reserved_keys = [
                 "total",
@@ -710,7 +710,7 @@ class Ccxt(Broker):
 
             return args
 
-        elif broker in ["kraken", "kucoin", "coinbasepro", "coinbase"]:
+        elif broker in ["kraken", "kucoin", "coinbasepro", "coinbase", "okx"]:
             params = {}
             if order.order_type in ["stop_limit"]:
                 params = {

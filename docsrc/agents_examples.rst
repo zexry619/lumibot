@@ -16,6 +16,7 @@ when you set ``IS_BACKTESTING = True`` in the flat runner.
    agents_example_warren_buffett_value
    agents_example_bill_ackman_concentrated
    agents_example_citadel_sector_pods
+   agents_example_adaptive_ai_trading_team
 
 These examples are inspired by public investing styles and firms. They are not
 affiliated with or endorsed by the investors, firms, or companies named.
@@ -56,6 +57,9 @@ Examples
    The same bull/bear debate structure applied to familiar large-cap stocks, so
    the reasoning is easier to inspect before using more volatile instruments.
    `Watch it live on BotSpot <https://botspot.trade/marketplace/strategy/932f3661-c552-4723-b247-869518a5d30f>`__.
+
+``adaptive_ai_trading_team_example.py``
+   An adaptive AI trading team strategy implementing decision logging, lessons learned, and gated execution inspired by the Meridian agent.
 
 ``ai_trading_team.py`` remains the shortest alias for the leveraged ETF example.
 New code should prefer the descriptive filenames above.

@@ -70,6 +70,58 @@ This page documents environment variables used by LumiBot, with an emphasis on *
 - Crypto futures/perpetuals: `Asset.AssetType.CRYPTO_FUTURE` routes through `crypto_future` when present, otherwise `crypto`, then `default`. USDT contracts such as `BTCUSDT`, `ETHUSDT`, and `SOLUSDT` can use USD spot history as the backtest price proxy.
 - Where: `lumibot/strategies/_strategy.py` datasource selection logic.
 
+## Crypto broker credentials
+
+### `BINANCE_FUTURES_DEMO_API_KEY` / `BINANCE_FUTURES_DEMO_API_SECRET`
+- Purpose: Binance USD-M Futures demo trading credentials for `lumibot/example_strategies/binance_futures_testnet_smoke.py` and `lumibot/example_strategies/binance_futures_demo_ai_trader.py`.
+- Values: Binance Futures demo API key and secret; never use live keys here.
+- Notes:
+  - The smoke test routes CCXT calls to Binance `demo-fapi` URLs and defaults to dry-run unless `--execute` is passed.
+  - The legacy `BINANCE_FUTURES_TESTNET_API_KEY` / `BINANCE_FUTURES_TESTNET_API_SECRET` names are accepted for local compatibility, but new setups should use the `DEMO` names.
+  - This validates futures-specific exchange behavior before wiring a full LumiBot strategy or AI agent around it.
+  - The demo runtime config can allow multiple active symbols with `max_open_positions`, but same-symbol pyramiding remains blocked and aggregate notional is capped by `max_total_notional_usdt`.
+
+### `BINANCE_FUTURES_LIVE_API_KEY` / `BINANCE_FUTURES_LIVE_API_SECRET`
+- Purpose: Binance USD-M Futures live trading credentials for `lumibot/example_strategies/binance_futures_demo_ai_trader.py --environment live`.
+- Values: Binance Futures live API key and secret; keep them separate from demo keys.
+- Notes:
+  - Live execution also requires `--live-confirm I_UNDERSTAND_LIVE_RISK`.
+  - Validate dry-run and demo execution before using live credentials.
+  - Prefer IP-restricted Binance keys on VPS.
+
+### `GEMINI_API_KEY`
+- Purpose: Gemini decision-maker credentials for `binance_futures_demo_ai_trader.py`.
+- Values: Gemini API key from Google AI Studio; never hardcode it.
+- Notes:
+  - The example also accepts `GOOGLE_API_KEY` as a compatibility alias.
+  - If unset, the trader fails closed unless `--allow-fallback` is passed.
+
+### `OPENAI_COMPATIBLE_BASE_URL` / `OPENAI_BASE_URL`
+- Purpose: OpenAI-compatible Chat Completions endpoint for `binance_futures_demo_ai_trader.py` when a model in `--models`, `--advisor-models`, or `--shadow-models` uses the `openai:` or `openai-compatible:` prefix.
+- Values: Base URL ending at the OpenAI-compatible API root, for example `http://localhost:8083/v1` or `https://<provider-host>/v1`.
+- Notes:
+  - The first model in `--models` is the primary execution model. Use `--models openai:gemini-3.5-flash --advisor-models qwen:qwen3.7-max-thinking` to keep an OpenAI-compatible Gemini endpoint final while adding Qwen as a pre-final second opinion.
+  - Advisor models are stored under `advisor_decision_comparisons` and added to the final model context. Shadow models are stored under `shadow_decision_comparisons` after the final decision. Neither advisor nor shadow models drive orders directly.
+  - `OPENAI_COMPATIBLE_BASE_URL` is preferred for this Binance futures trader; `OPENAI_BASE_URL` is accepted for SDK compatibility.
+
+### `OPENAI_COMPATIBLE_API_KEY` / `OPENAI_API_KEY`
+- Purpose: API key for the OpenAI-compatible endpoint used by `binance_futures_demo_ai_trader.py` execution or shadow comparison models.
+- Values: Provider key; never hardcode it.
+- Notes:
+  - Local no-auth endpoints on `localhost`, `127.0.0.1`, or `[::1]` can omit this key. The bot uses a dummy key internally because the OpenAI SDK requires one.
+  - Hosted providers should set `OPENAI_COMPATIBLE_API_KEY`; `OPENAI_API_KEY` is accepted for OpenAI SDK compatibility.
+
+### `QWEN_OPENAI_COMPATIBLE_BASE_URL` / `QWEN_OPENAI_BASE_URL`
+- Purpose: Separate Qwen OpenAI-compatible Chat Completions endpoint for `binance_futures_demo_ai_trader.py` when a model uses the `qwen:` prefix.
+- Values: Base URL ending at the OpenAI-compatible API root, for example `http://127.0.0.1:7860/v1`.
+- Notes:
+  - This is intentionally separate from `OPENAI_COMPATIBLE_BASE_URL` so a Gemini OpenAI-compatible bridge and a Qwen bridge can run side by side.
+  - Qwen model requests automatically include `extra_body={"enable_thinking": false}`.
+
+### `QWEN_OPENAI_COMPATIBLE_API_KEY` / `QWEN_API_KEY`
+- Purpose: API key for the Qwen OpenAI-compatible endpoint used by `qwen:` advisor or shadow models.
+- Values: Provider/local bridge key; never hardcode it in committed files.
+
 ## Testing / CI guardrails (engineering-only)
 
 ### `LUMIBOT_ACCEPTANCE_TRIPWIRE`
@@ -341,10 +393,17 @@ Notes:
 - Default: `2` in backtests, `10` in live trading.
 - Notes: Backtests default to a lower retry budget so a bad provider window does not multiply model spend across many simulated iterations.
 
+### `DISCORD_WEBHOOK_URL`
+- Purpose: Discord webhook URL for strategy notifications.
+- Values: Full Discord webhook URL; never hardcode it in public repos.
+- Notes: Also used by the Binance futures AI trader when `--notify-events` is set.
+
 ### `TELEGRAM_BOT_TOKEN`
 - Purpose: Telegram Bot API token for `self.notifications.configure_telegram()`.
 - Values: Bot token from BotFather.
+- Notes: Also used by the Binance futures AI trader when `--notify-events` is set.
 
 ### `TELEGRAM_CHAT_ID`
 - Purpose: Telegram chat/channel/user id for strategy notifications.
 - Values: Telegram chat id.
+- Notes: Also used by the Binance futures AI trader when `--notify-events` is set.
