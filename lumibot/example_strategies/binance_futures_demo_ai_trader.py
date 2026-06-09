@@ -3566,6 +3566,16 @@ def _closed_trade_generic_income_payload(
         else:
             realized_pnl = entry_cost - total_cost
 
+        # Sum entry fees as well to get accurate net PnL matching the exchange Web UI
+        entry_side = "buy" if position_side == "long" else "sell"
+        entry_trades = [
+            _normalize_trade(exchange, symbol, t)
+            for t in trades
+            if str(t.get("side")).lower() == entry_side
+        ]
+        total_entry_fee = sum(_decimal((t.get("fee") or {}).get("cost") or 0) for t in entry_trades)
+        total_fee += total_entry_fee
+
         net_pnl = realized_pnl - total_fee
 
         return {
