@@ -4238,7 +4238,11 @@ def _fetch_account_positions(exchange, account: dict[str, Any] | None | Any = _A
         market_id = _market_id(exchange, symbol)
         contract_size = _decimal(pos.get("contractSize") or (exchange.markets.get(symbol) or {}).get("contractSize") or 1)
         amount = abs(contracts * contract_size)
-        side = "long" if contracts > 0 else "short"
+        side = pos.get("side")
+        if not side:
+            side = "long" if contracts > 0 else "short"
+        else:
+            side = side.lower()
         positions[market_id] = PositionSummary(
             side=side,
             amount=amount,
@@ -4411,7 +4415,10 @@ def _close_position(
     side = "sell" if position.side == "long" else "buy"
     params: dict[str, Any] = {}
     if dual_side:
-        params["positionSide"] = "LONG" if position.side == "long" else "SHORT"
+        if exchange.id == "okx":
+            params["posSide"] = "long" if position.side == "long" else "short"
+        else:
+            params["positionSide"] = "LONG" if position.side == "long" else "SHORT"
     else:
         params["reduceOnly"] = True
 
@@ -4761,7 +4768,10 @@ def _place_native_protection_prices(
 
     base_params: dict[str, Any] = {"workingType": "MARK_PRICE"}
     if dual_side:
-        base_params["positionSide"] = _position_side_for_open(entry_side)
+        if exchange.id == "okx":
+            base_params["posSide"] = "long" if entry_side == "buy" else "short"
+        else:
+            base_params["positionSide"] = _position_side_for_open(entry_side)
     else:
         base_params["reduceOnly"] = True
 
@@ -4819,6 +4829,8 @@ def _create_native_protection_orders(
         }
         if "positionSide" in base_params:
             algo_base_params["positionSide"] = base_params["positionSide"]
+        if "posSide" in base_params:
+            algo_base_params["posSide"] = base_params["posSide"]
         stop_order = post_algo_order(
             {
                 **algo_base_params,
@@ -6501,7 +6513,10 @@ def _run_iteration(
 
     params: dict[str, Any] = {}
     if dual_side:
-        params["positionSide"] = _position_side_for_open(side)
+        if exchange.id == "okx":
+            params["posSide"] = "long" if side == "buy" else "short"
+        else:
+            params["positionSide"] = _position_side_for_open(side)
 
     print(
         f"Entry order: side={side} amount={amount} estimated_notional_usdt={estimated_notional:.4f} "
