@@ -71,7 +71,7 @@
     "adaptive_risk_min_multiplier": "0.50",
     "adaptive_risk_max_multiplier": "1.00",
     "breakeven_trigger_pct": "0.55",
-    "breakeven_offset_pct": "0.05",
+    "breakeven_offset_pct": "0.15",
     "trailing_activation_pct": "0.8",
     "trailing_distance_pct": "0.35",
     "dynamic_protection_reprice": true,
