@@ -531,7 +531,20 @@ def _normalize_ai_decision_payload(payload: dict[str, Any]) -> AIDecision:
     if action not in {"BUY", "SELL", "HOLD", "CLOSE"}:
         action = "HOLD"
 
-    confidence = _decimal(payload.get("confidence", "0"))
+    raw_conf = payload.get("confidence", "0")
+    if isinstance(raw_conf, str):
+        lowered = raw_conf.lower().strip()
+        if lowered in {"high", "strong"}:
+            confidence = Decimal("0.85")
+        elif lowered in {"medium", "moderate"}:
+            confidence = Decimal("0.65")
+        elif lowered in {"low", "weak"}:
+            confidence = Decimal("0.35")
+        else:
+            confidence = _ai_decimal(raw_conf)
+    else:
+        confidence = _ai_decimal(raw_conf)
+
     if confidence < 0:
         confidence = Decimal("0")
     if confidence > 1:
