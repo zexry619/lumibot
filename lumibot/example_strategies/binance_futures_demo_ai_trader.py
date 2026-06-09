@@ -3499,6 +3499,84 @@ def _position_from_open_trade(open_trade: dict[str, Any]) -> PositionSummary | N
     return PositionSummary(side=side, amount=amount, entry_price=entry_price, unrealized_pnl=Decimal("0"))
 
 
+def _closed_trade_generic_income_payload(
+    exchange,
+    symbol: str,
+    open_trade: dict[str, Any],
+) -> dict[str, str]:
+    try:
+        opened_at_str = open_trade.get("opened_at")
+        if not opened_at_str:
+            return {}
+        opened_at_str = opened_at_str.replace("Z", "+00:00")
+        opened_dt = datetime.fromisoformat(opened_at_str)
+        since_ms = int(opened_dt.timestamp() * 1000) - 60_000
+
+        trades = exchange.fetch_my_trades(symbol, since=since_ms, limit=100)
+        if not trades:
+            return {}
+
+        position_side = open_trade.get("side")
+        close_side = "sell" if position_side == "long" else "buy"
+
+        close_trades = [
+            t for t in trades
+            if str(t.get("side")).lower() == close_side
+        ]
+        if not close_trades:
+            return {}
+
+        close_trades.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
+
+        target_amount = _decimal(open_trade.get("amount"))
+        accumulated_amount = Decimal("0")
+        total_cost = Decimal("0")
+        total_amount = Decimal("0")
+        total_fee = Decimal("0")
+
+        for t in close_trades:
+            trade_amount = _decimal(t.get("amount") or 0)
+            trade_cost = _decimal(t.get("cost") or 0)
+            if trade_cost <= 0:
+                trade_cost = trade_amount * _decimal(t.get("price") or 0)
+
+            fee = t.get("fee") or {}
+            trade_fee = _decimal(fee.get("cost") or 0)
+
+            total_cost += trade_cost
+            total_amount += trade_amount
+            total_fee += trade_fee
+
+            accumulated_amount += trade_amount
+            if accumulated_amount >= target_amount * Decimal("0.99"):
+                break
+
+        if total_amount <= 0:
+            return {}
+
+        avg_price = total_cost / total_amount
+        entry_price = _decimal(open_trade.get("entry_price"))
+
+        if position_side == "long":
+            realized_pnl = total_cost - (total_amount * entry_price)
+        else:
+            realized_pnl = (total_amount * entry_price) - total_cost
+
+        net_pnl = realized_pnl - total_fee
+
+        return {
+            "exit_price": str(avg_price),
+            "binance_realized_pnl_usdt": str(realized_pnl),
+            "binance_net_pnl_usdt": str(net_pnl),
+            "binance_commission_usdt": str(total_fee),
+            "binance_pnl_source": "user_trades_generic",
+            "exit_price_source": "user_trades_generic",
+        }
+    except Exception as exc:
+        print(f"Could not fetch generic income for closed trade {symbol}: {exc}")
+        return {}
+
+
 def _maybe_record_external_close(
     exchange,
     state: dict[str, Any],
@@ -3515,7 +3593,17 @@ def _maybe_record_external_close(
     position = _position_from_open_trade(previous_open_trade)
     if position is None:
         return
-    binance_income = _closed_trade_binance_income_payload(exchange, symbol, previous_open_trade, _now_ms())
+
+    binance_income = None
+    if exchange.id == "binance" or exchange.id == "binanceusdm":
+        binance_income = _closed_trade_binance_income_payload(exchange, symbol, previous_open_trade, _now_ms())
+    else:
+        generic_income = _closed_trade_generic_income_payload(exchange, symbol, previous_open_trade)
+        if generic_income:
+            binance_income = generic_income
+            if "exit_price" in generic_income:
+                last_price = _decimal(generic_income["exit_price"])
+
     _record_trade_outcome(
         state,
         args,
