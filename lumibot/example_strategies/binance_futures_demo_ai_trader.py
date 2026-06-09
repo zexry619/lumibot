@@ -5869,6 +5869,19 @@ def _cleanup_flat_symbol_stale_orders(
     cleanup_state[symbol] = str(now)
 
 
+def _has_recent_ai_hold(state: dict[str, Any], symbol: str, cooldown_minutes: Decimal) -> bool:
+    now = _now_ts()
+    cooldown_seconds = _seconds(cooldown_minutes)
+    events = state.get("entry_block_events", [])
+    if isinstance(events, list):
+        for event in reversed(events):
+            if isinstance(event, dict) and event.get("symbol") == symbol and event.get("category") == "ai_hold":
+                event_ts = _decimal(event.get("ts"))
+                if now - event_ts < cooldown_seconds:
+                    return True
+    return False
+
+
 def _select_symbol_and_candidates_for_iteration(
     exchange,
     args: argparse.Namespace,
@@ -5894,6 +5907,13 @@ def _select_symbol_and_candidates_for_iteration(
         if block_reason:
             print(f"symbol_blocked={symbol} reason={block_reason}")
             continue
+        
+        # Filter out symbols under recent AI decision cooldown
+        cooldown_mins = Decimal(str(getattr(args, "ai_decision_cooldown_minutes", "15")))
+        if state is not None and _has_recent_ai_hold(state, symbol, cooldown_mins):
+            print(f"Skipping selection for {symbol}: under AI decision cooldown.")
+            continue
+            
         tradeable_symbols.append(symbol)
 
     if not tradeable_symbols:
