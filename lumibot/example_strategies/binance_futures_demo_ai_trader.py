@@ -353,16 +353,31 @@ def _ema(values: list[Decimal], period: int) -> Decimal:
 def _rsi(closes: list[Decimal], period: int = 14) -> Decimal:
     if len(closes) <= period:
         raise ValueError(f"Need more than {period} closes for RSI")
-    gains: list[Decimal] = []
-    losses: list[Decimal] = []
-    for prev, current in zip(closes[-period - 1 : -1], closes[-period:]):
-        change = current - prev
-        gains.append(max(change, Decimal("0")))
-        losses.append(max(-change, Decimal("0")))
-    avg_gain = sum(gains) / Decimal(period)
-    avg_loss = sum(losses) / Decimal(period)
+    
+    # Calculate all price changes
+    changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [max(c, Decimal("0")) for c in changes]
+    losses = [max(-c, Decimal("0")) for c in changes]
+    
+    if len(changes) < period:
+        raise ValueError(f"Need more than {period} closes for RSI")
+        
+    # First average gain and loss (SMA)
+    avg_gain = sum(gains[:period]) / Decimal(period)
+    avg_loss = sum(losses[:period]) / Decimal(period)
+    
+    # Wilder's smoothing
+    for i in range(period, len(changes)):
+        avg_gain = (avg_gain * Decimal(str(period - 1)) + gains[i]) / Decimal(period)
+        avg_loss = (avg_loss * Decimal(str(period - 1)) + losses[i]) / Decimal(period)
+        
+    if avg_gain == 0 and avg_loss == 0:
+        return Decimal("50")  # Neutral if flat
     if avg_loss == 0:
         return Decimal("100")
+    if avg_gain == 0:
+        return Decimal("0")
+        
     rs = avg_gain / avg_loss
     return Decimal("100") - (Decimal("100") / (Decimal("1") + rs))
 
@@ -370,14 +385,24 @@ def _rsi(closes: list[Decimal], period: int = 14) -> Decimal:
 def _atr(candles: list[list[Any]], period: int = 14) -> Decimal:
     if len(candles) <= period:
         raise ValueError(f"Need more than {period} candles for ATR")
+        
+    # Calculate all true ranges
     true_ranges: list[Decimal] = []
-    recent = candles[-period - 1 :]
-    for previous, current in zip(recent[:-1], recent[1:]):
-        previous_close = _decimal(previous[4])
-        high = _decimal(current[2])
-        low = _decimal(current[3])
-        true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
-    return sum(true_ranges) / Decimal(period)
+    for i in range(1, len(candles)):
+        previous_close = _decimal(candles[i-1][4])
+        high = _decimal(candles[i][2])
+        low = _decimal(candles[i][3])
+        tr = max(high - low, abs(high - previous_close), abs(low - previous_close))
+        true_ranges.append(tr)
+        
+    # First ATR is the simple average of first 'period' true ranges
+    atr_val = sum(true_ranges[:period]) / Decimal(period)
+    
+    # Wilder's smoothing
+    for i in range(period, len(true_ranges)):
+        atr_val = (atr_val * Decimal(str(period - 1)) + true_ranges[i]) / Decimal(period)
+        
+    return atr_val
 
 
 def _calculate_indicators(candles: list[list[Any]], fast_period: int, slow_period: int) -> Indicators:
@@ -1077,7 +1102,52 @@ def _decision_prompt(
     candidate_set: list[SymbolCandidate] | None = None,
     entry_aggressiveness: Decimal = Decimal("0.50"),
     context_payload: dict[str, Any] | None = None,
+    is_screener: bool = False,
 ) -> dict[str, Any]:
+    if is_screener:
+        position_payload = {
+            "has_position": False,
+            "side": "flat",
+            "amount": "0",
+            "entry_price": "0",
+            "unrealized_pnl": "0",
+        }
+        if position:
+            position_payload = {
+                "has_position": True,
+                "side": position.side,
+                "amount": str(position.amount),
+                "entry_price": str(position.entry_price),
+                "unrealized_pnl": str(position.unrealized_pnl),
+            }
+        prompt = {
+            "role": "You are a fast market screener for a trading bot.",
+            "task": (
+                "Return only JSON with keys action, confidence, and reason. "
+                "action must be BUY, SELL, HOLD, or CLOSE. "
+                "Use BUY or SELL only if there is a strong trend-aligned signal from indicators and experts. "
+                "Use CLOSE if current_position has_position is true and a clear reversal signal is present. "
+                "Otherwise, return HOLD. "
+                "Do not wrap the JSON in markdown. "
+                "Example: {\"action\": \"HOLD\", \"confidence\": 0.95, \"reason\": \"...\"}"
+            ),
+            "symbol": symbol,
+            "entry_aggressiveness": str(entry_aggressiveness),
+            "indicators": {
+                "close": str(indicators.close),
+                "ema_fast": str(indicators.ema_fast),
+                "ema_slow": str(indicators.ema_slow),
+                "rsi": str(indicators.rsi),
+                "atr": str(indicators.atr),
+                "atr_pct": str(indicators.atr_pct),
+                "trend": indicators.trend,
+            },
+            "market_regime": _regime_payload(regime),
+            "expert_signals": _signal_payload(expert_signals),
+            "current_position": position_payload,
+        }
+        return prompt
+
     position_payload = {
         "has_position": False,
         "side": "flat",
@@ -1108,6 +1178,11 @@ def _decision_prompt(
             "{\"agents\":[{\"name\":\"market_analyst\",\"action\":\"HOLD\",\"confidence\":0.5,\"reason\":\"...\"}],"
             "\"final_decision\":{\"action\":\"HOLD\",\"confidence\":0.5,\"reason\":\"...\"}}. "
             "Actions must be BUY, SELL, HOLD, or CLOSE. Confidence must be 0.0 to 1.0. "
+            "CLOSE should ONLY be used when: (1) the position is losing AND trend has clearly reversed on "
+            "at least 2 higher timeframes, OR (2) the unrealized loss is significant relative to the stop-loss threshold. "
+            "Do NOT close a position that is profitable or at breakeven unless there is a strong reversal signal "
+            "on at least 2 higher timeframes. Prefer HOLD over CLOSE when the trend is still aligned with the "
+            "position direction. A premature CLOSE at breakeven wastes fees and opportunity. "
             "For BUY/SELL, entry_plan may include entry_style, limit_price, stop_atr_multiplier, reward_risk, "
             "max_wait_minutes, and invalidation. entry_style must be market, marketable_limit, wait_pullback, "
             "wait_breakout, or default. Prefer wait_pullback instead of chasing when decision latency, spread, "
@@ -1340,6 +1415,7 @@ def _gemini_decision(
     entry_aggressiveness: Decimal = Decimal("0.50"),
     context_payload: dict[str, Any] | None = None,
     adversarial_debate: bool = False,
+    is_screener: bool = False,
 ) -> MultiAgentDecision:
     model_chain = [models] if isinstance(models, str) else list(models)
     if not model_chain:
@@ -1356,6 +1432,7 @@ def _gemini_decision(
         candidate_set,
         entry_aggressiveness,
         context_payload,
+        is_screener=is_screener,
     )
 
     if adversarial_debate and position is None:
@@ -2645,7 +2722,12 @@ def _closed_trade_pnls(state: dict[str, Any], lookback: int) -> list[tuple[dict[
     for trade in trades[-lookback:]:
         if not isinstance(trade, dict):
             continue
-        result.append((trade, _decimal(trade.get("estimated_pnl_usdt_before_fees"))))
+        pnl = _decimal(
+            trade.get("binance_net_pnl_usdt")
+            or trade.get("binance_realized_pnl_usdt")
+            or trade.get("estimated_pnl_usdt_before_fees")
+        )
+        result.append((trade, pnl))
     return result
 
 
@@ -3025,7 +3107,11 @@ def _performance_context_payload(state: dict[str, Any], symbol: str, lookback: i
     symbol_recent = [trade for trade in recent if trade.get("symbol") == symbol]
 
     def summarize(items: list[dict[str, Any]]) -> dict[str, str]:
-        pnls = [_decimal(item.get("estimated_pnl_usdt_before_fees")) for item in items]
+        pnls = [_decimal(
+            item.get("binance_net_pnl_usdt")
+            or item.get("binance_realized_pnl_usdt")
+            or item.get("estimated_pnl_usdt_before_fees")
+        ) for item in items]
         wins = sum(1 for pnl in pnls if pnl > 0)
         losses = sum(1 for pnl in pnls if pnl < 0)
         gross_win = sum((pnl for pnl in pnls if pnl > 0), Decimal("0"))
@@ -5027,7 +5113,7 @@ def _protection_order_id(order: dict[str, Any]) -> str:
     return str(order.get("algoId") or order.get("id") or (order.get("info") or {}).get("algoId") or "")
 
 
-def _fetch_open_algo_orders(exchange, symbol: str) -> list[dict[str, Any]]:
+def _fetch_open_algo_orders(exchange, symbol: str, position: PositionSummary | None = None) -> list[dict[str, Any]]:
     getter = getattr(exchange, "fapiPrivateGetOpenAlgoOrders", None)
     if getter is None and exchange.id == "okx":
         getter = getattr(exchange, "privateGetTradeOrdersAlgoPending", None)
@@ -5038,15 +5124,24 @@ def _fetch_open_algo_orders(exchange, symbol: str) -> list[dict[str, Any]]:
             market_id = _market_id(exchange, symbol)
             mapped_orders = []
             for ord_type in ["trigger", "conditional"]:
-                response = getter({"instId": market_id, "ordType": ord_type})
+                response = getter({"instId": market_id, "ordType": ord_type, "instType": "SWAP"})
                 if response and "data" in response:
                     for o in response["data"]:
                         trigger_px = float(o.get("triggerPx") or 0)
-                        last_px = float(o.get("last") or 0)
+                        if position:
+                            is_long = (position.side == "long")
+                            orderType = "STOP_MARKET" if (trigger_px < float(position.entry_price) if is_long else trigger_px > float(position.entry_price)) else "TAKE_PROFIT_MARKET"
+                        else:
+                            try:
+                                ticker = exchange.fetch_ticker(symbol)
+                                last_px = float(ticker.get("last") or 0)
+                            except Exception:
+                                last_px = 0.0
+                            orderType = "STOP_MARKET" if (trigger_px < last_px and last_px > 0) else "TAKE_PROFIT_MARKET"
                         mapped_orders.append({
                             "algoId": o.get("algoId"),
                             "symbol": symbol,
-                            "orderType": "STOP_MARKET" if trigger_px < last_px else "TAKE_PROFIT_MARKET",
+                            "orderType": orderType,
                             "algoStatus": "NEW" if o.get("state") == "live" else o.get("state"),
                         })
             return mapped_orders
@@ -5060,8 +5155,8 @@ def _fetch_open_algo_orders(exchange, symbol: str) -> list[dict[str, Any]]:
     return list(orders or [])
 
 
-def _native_protection_order_types(exchange, symbol: str) -> list[str]:
-    algo_orders = _fetch_open_algo_orders(exchange, symbol)
+def _native_protection_order_types(exchange, symbol: str, position: PositionSummary | None = None) -> list[str]:
+    algo_orders = _fetch_open_algo_orders(exchange, symbol, position)
     if algo_orders:
         return [
             str(order.get("orderType") or order.get("type") or (order.get("info") or {}).get("orderType") or "").upper()
@@ -5081,14 +5176,14 @@ def _native_protection_order_types(exchange, symbol: str) -> list[str]:
     ]
 
 
-def _native_protection_order_count(exchange, symbol: str) -> int:
-    return sum(1 for order_type in _native_protection_order_types(exchange, symbol) if order_type in {"STOP_MARKET", "TAKE_PROFIT_MARKET"})
+def _native_protection_order_count(exchange, symbol: str, position: PositionSummary | None = None) -> int:
+    return sum(1 for order_type in _native_protection_order_types(exchange, symbol, position) if order_type in {"STOP_MARKET", "TAKE_PROFIT_MARKET"})
 
 
-def _native_protection_prices_from_orders(exchange, symbol: str) -> tuple[Decimal | None, Decimal | None]:
+def _native_protection_prices_from_orders(exchange, symbol: str, position: PositionSummary | None = None) -> tuple[Decimal | None, Decimal | None]:
     stop_price: Decimal | None = None
     take_profit_price: Decimal | None = None
-    for order in _fetch_open_algo_orders(exchange, symbol):
+    for order in _fetch_open_algo_orders(exchange, symbol, position):
         if str(order.get("algoStatus") or order.get("status") or "NEW").upper() != "NEW":
             continue
         order_type = str(order.get("orderType") or order.get("type") or (order.get("info") or {}).get("orderType") or "").upper()
@@ -5191,7 +5286,7 @@ def _maybe_reprice_native_protection(
     if interval > 0 and last_reprice > 0 and now - last_reprice < interval:
         return False
     desired_stop, desired_take_profit = _reprice_candidate_prices(position, open_trade, last_price, args)
-    order_stop, order_take_profit = _native_protection_prices_from_orders(exchange, symbol)
+    order_stop, order_take_profit = _native_protection_prices_from_orders(exchange, symbol, position)
     protection_state = open_trade.get("native_protection") if isinstance(open_trade.get("native_protection"), dict) else {}
     current_stop = order_stop if order_stop is not None else _decimal(protection_state.get("stop_price"))
     current_take_profit = order_take_profit if order_take_profit is not None else _decimal(protection_state.get("take_profit_price"))
@@ -5262,7 +5357,7 @@ def _ensure_native_protection(
         return
     if not args.execute:
         return
-    order_types = _native_protection_order_types(exchange, symbol)
+    order_types = _native_protection_order_types(exchange, symbol, position)
     if order_types.count("STOP_MARKET") == 1 and order_types.count("TAKE_PROFIT_MARKET") == 1:
         return
 
@@ -5677,9 +5772,10 @@ def _review_closed_trade(
         agg = max(agg - Decimal("0.05"), Decimal("0.20"))
         overrides["ai_entry_aggressiveness"] = str(agg)
 
+        # NOTE: Stop-loss tightening after losses removed to prevent death spiral.
+        # Tighter stops cause more stop-outs, leading to more losses, leading to even tighter stops.
+        # Auto-tune handles stop-loss adjustments based on aggregate performance instead.
         sl = Decimal(str(overrides.get("stop_loss_pct", args.stop_loss_pct)))
-        sl = max(sl - Decimal("0.05"), Decimal("0.40"))
-        overrides["stop_loss_pct"] = str(sl)
 
         print(
             f"[Threshold Evolution] Loss in {symbol} ({pnl_pct:.2f}%). "
@@ -6370,53 +6466,104 @@ def _run_iteration(
             )
             return state
 
-    advisor_comparisons = _advisor_decision_comparisons(
-        args,
-        state,
-        symbol,
-        indicators,
-        position,
-        expert_signals,
-        timeframe_indicators,
-        regime,
-        recent_reviews,
-        candidate_set,
-        ai_context,
-    )
-    if advisor_comparisons:
-        ai_context["model_comparison_context"] = {
-            "execution_model": ",".join(_model_chain(args)),
-            "advisor_models": ",".join(_advisor_model_chain(args)),
-            "advisory_only": True,
-            "rule": "Advisor model output is context only; Gemini execution model makes the final tradable decision.",
-            "advisor_comparisons": advisor_comparisons,
-        }
+    # Screener-Reasoner (Gatekeeper) Hierarchy:
+    # Step 1: Run fast screener (Gemini)
+    screener_models = _model_chain(args)
+    advisor_models = _advisor_model_chain(args)
+    
+    if advisor_models:
+        print(f"[Gatekeeper] Running fast screener using {','.join(screener_models)}...")
+        try:
+            screener_multi = _gemini_decision(
+                screener_models,
+                indicators,
+                position,
+                symbol,
+                expert_signals,
+                timeframe_indicators,
+                regime,
+                recent_reviews,
+                candidate_set,
+                getattr(args, "ai_max_retries", 2),
+                getattr(args, "ai_retry_delay_seconds", 1.0),
+                getattr(args, "ai_request_timeout_seconds", 180.0),
+                getattr(args, "ai_entry_aggressiveness", Decimal("0.50")),
+                ai_context,
+                adversarial_debate=False,  # Keep screener fast and cheap
+                is_screener=True,
+            )
+            screener_eff = _effective_multi_agent_decision(screener_multi)
+            screener_action = screener_eff.decision.action
+        except Exception as exc:
+            print(f"[Gatekeeper] Screener failed: {exc}. Falling back to deep reasoner directly.")
+            screener_action = "DEBATE"
+            screener_multi = None
 
-    try:
-        multi_agent_decision = _gemini_decision(
-            _model_chain(args),
-            indicators,
-            position,
-            symbol,
-            expert_signals,
-            timeframe_indicators,
-            regime,
-            recent_reviews,
-            candidate_set,
-            getattr(args, "ai_max_retries", 2),
-            getattr(args, "ai_retry_delay_seconds", 1.0),
-            getattr(args, "ai_request_timeout_seconds", 180.0),
-            getattr(args, "ai_entry_aggressiveness", Decimal("0.50")),
-            ai_context,
-            adversarial_debate=getattr(args, "adversarial_debate", False),
-        )
-    except Exception as exc:
-        if args.allow_fallback:
-            print(f"AI decision failed, using deterministic fallback: {exc}")
-            multi_agent_decision = _multi_agent_fallback(indicators)
+        if screener_action == "HOLD":
+            print(f"[Gatekeeper] Screener returned HOLD. Skipping deep reasoning to save tokens.")
+            multi_agent_decision = screener_multi
         else:
-            print(f"AI decision failed after retries; failing closed with HOLD: {exc}")
-            multi_agent_decision = _hold_decision("AI unavailable after retries; fail-closed HOLD.")
+            print(f"[Gatekeeper] Screener returned {screener_action}. Invoking deep reasoner {','.join(advisor_models)}...")
+            if screener_multi:
+                screener_eff = _effective_multi_agent_decision(screener_multi)
+                ai_context["screener_proposal"] = {
+                    "action": screener_eff.decision.action,
+                    "confidence": str(screener_eff.decision.confidence),
+                    "reason": screener_eff.decision.reason,
+                }
+            
+            try:
+                multi_agent_decision = _gemini_decision(
+                    advisor_models,  # Advisor models (Qwen) acts as final reasoner/judge
+                    indicators,
+                    position,
+                    symbol,
+                    expert_signals,
+                    timeframe_indicators,
+                    regime,
+                    recent_reviews,
+                    candidate_set,
+                    getattr(args, "ai_max_retries", 2),
+                    getattr(args, "ai_retry_delay_seconds", 1.0),
+                    getattr(args, "ai_request_timeout_seconds", 180.0),
+                    getattr(args, "ai_entry_aggressiveness", Decimal("0.50")),
+                    ai_context,
+                    adversarial_debate=getattr(args, "adversarial_debate", False),
+                )
+            except Exception as exc:
+                if args.allow_fallback:
+                    print(f"Deep reasoning failed, using deterministic fallback: {exc}")
+                    multi_agent_decision = _multi_agent_fallback(indicators)
+                else:
+                    print(f"Deep reasoning failed after retries; failing closed with HOLD: {exc}")
+                    multi_agent_decision = _hold_decision("Deep reasoning unavailable; fail-closed HOLD.")
+    else:
+        # No advisor models configured, run standard execution flow using primary model
+        try:
+            multi_agent_decision = _gemini_decision(
+                screener_models,
+                indicators,
+                position,
+                symbol,
+                expert_signals,
+                timeframe_indicators,
+                regime,
+                recent_reviews,
+                candidate_set,
+                getattr(args, "ai_max_retries", 2),
+                getattr(args, "ai_retry_delay_seconds", 1.0),
+                getattr(args, "ai_request_timeout_seconds", 180.0),
+                getattr(args, "ai_entry_aggressiveness", Decimal("0.50")),
+                ai_context,
+                adversarial_debate=getattr(args, "adversarial_debate", False),
+            )
+        except Exception as exc:
+            if args.allow_fallback:
+                print(f"AI decision failed, using deterministic fallback: {exc}")
+                multi_agent_decision = _multi_agent_fallback(indicators)
+            else:
+                print(f"AI decision failed after retries; failing closed with HOLD: {exc}")
+                multi_agent_decision = _hold_decision("AI unavailable; fail-closed HOLD.")
 
     for agent in multi_agent_decision.agents:
         print(
@@ -6440,8 +6587,17 @@ def _run_iteration(
         candidate_set,
         ai_context,
     )
+    advisor_comparisons = []
 
     if decision.action == "CLOSE" and position:
+        min_close_confidence = Decimal("0.65")
+        if decision.confidence < min_close_confidence:
+            print(
+                f"AI CLOSE blocked: confidence {decision.confidence} < min_close_confidence {min_close_confidence}. "
+                f"Treating as HOLD."
+            )
+            _record_entry_block(state, symbol, "ai_close_low_confidence", f"confidence {decision.confidence} < {min_close_confidence}")
+            return state
         close_execution = _close_position(exchange, symbol, position, dual_side, args.execute)
         close_time_ms = _now_ms()
         close_price = _close_execution_price(close_execution, last_price)
