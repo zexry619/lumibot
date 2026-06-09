@@ -3120,9 +3120,8 @@ def _normalize_trade(exchange, symbol: str, trade: dict[str, Any]) -> dict[str, 
     normalized = dict(trade)
     if normalized.get("amount") is not None:
         normalized["amount"] = float(Decimal(str(normalized["amount"])) * contract_size)
-    if normalized.get("cost") is not None:
-        normalized["cost"] = float(Decimal(str(normalized["cost"])) * contract_size)
     return normalized
+
 
 
 def _fetch_okx_sentiment_context(exchange, symbol: str) -> dict[str, Any]:
@@ -3520,7 +3519,8 @@ def _closed_trade_generic_income_payload(
         close_side = "sell" if position_side == "long" else "buy"
 
         close_trades = [
-            t for t in trades
+            _normalize_trade(exchange, symbol, t)
+            for t in trades
             if str(t.get("side")).lower() == close_side
         ]
         if not close_trades:
@@ -3532,19 +3532,22 @@ def _closed_trade_generic_income_payload(
         accumulated_amount = Decimal("0")
         total_cost = Decimal("0")
         total_amount = Decimal("0")
+        total_price_volume = Decimal("0")
         total_fee = Decimal("0")
 
         for t in close_trades:
             trade_amount = _decimal(t.get("amount") or 0)
+            trade_price = _decimal(t.get("price") or 0)
             trade_cost = _decimal(t.get("cost") or 0)
             if trade_cost <= 0:
-                trade_cost = trade_amount * _decimal(t.get("price") or 0)
+                trade_cost = trade_amount * trade_price
 
             fee = t.get("fee") or {}
             trade_fee = _decimal(fee.get("cost") or 0)
 
             total_cost += trade_cost
             total_amount += trade_amount
+            total_price_volume += trade_price * trade_amount
             total_fee += trade_fee
 
             accumulated_amount += trade_amount
@@ -3554,13 +3557,14 @@ def _closed_trade_generic_income_payload(
         if total_amount <= 0:
             return {}
 
-        avg_price = total_cost / total_amount
+        avg_price = total_price_volume / total_amount
         entry_price = _decimal(open_trade.get("entry_price"))
+        entry_cost = total_amount * entry_price
 
         if position_side == "long":
-            realized_pnl = total_cost - (total_amount * entry_price)
+            realized_pnl = total_cost - entry_cost
         else:
-            realized_pnl = (total_amount * entry_price) - total_cost
+            realized_pnl = entry_cost - total_cost
 
         net_pnl = realized_pnl - total_fee
 
@@ -4525,6 +4529,27 @@ def _close_position(
         ))
         print(f"Close order: id={order.get('id')} status={order.get('status')}")
         price = _order_average_price(order, Decimal("0"))
+        if price <= 0 and order.get("id"):
+            try:
+                time.sleep(0.5)
+                fetched_order = _normalize_order(exchange, exchange.fetch_order(order["id"], symbol))
+                price = _order_average_price(fetched_order, Decimal("0"))
+            except Exception as e:
+                print(f"Could not fetch closed order average price for {symbol}: {e}")
+
+        if price <= 0 and order.get("id"):
+            try:
+                since_ms = int(time.time() * 1000) - 30000
+                trades = exchange.fetch_my_trades(symbol, since=since_ms, limit=10)
+                order_trades = [t for t in trades if t.get("order") == order["id"]]
+                if order_trades:
+                    total_price_volume = sum(_decimal(t.get("price") or 0) * _decimal(t.get("amount") or 0) for t in order_trades)
+                    total_amount = sum(_decimal(t.get("amount") or 0) for t in order_trades)
+                    if total_amount > 0:
+                        price = total_price_volume / total_amount
+            except Exception as e:
+                print(f"Could not fetch trades for close order {order.get('id')}: {e}")
+
         report = _order_execution_report(exchange, symbol, order)
         binance_fill_price = _decimal(report.get("binance_fill_price"))
         if binance_fill_price > 0:
