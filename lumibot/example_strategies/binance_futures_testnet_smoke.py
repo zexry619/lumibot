@@ -226,21 +226,32 @@ def _market_min_notional(market: dict[str, Any]) -> Decimal | None:
 
 
 def _market_amount_step(market: dict[str, Any]) -> Decimal | None:
+    step = None
     info = market.get("info") or {}
     for filter_type in ("MARKET_LOT_SIZE", "LOT_SIZE"):
         for market_filter in info.get("filters") or []:
             if market_filter.get("filterType") == filter_type and market_filter.get("stepSize") is not None:
-                return Decimal(str(market_filter["stepSize"]))
+                step = Decimal(str(market_filter["stepSize"]))
+                break
+        if step is not None:
+            break
 
-    precision_amount = (market.get("precision") or {}).get("amount")
-    if precision_amount is None:
-        return None
-    precision_decimal = Decimal(str(precision_amount))
-    if precision_decimal <= 0:
-        return None
-    if precision_decimal >= 1:
-        return Decimal(1).scaleb(-int(precision_decimal))
-    return precision_decimal
+    if step is None:
+        precision_amount = (market.get("precision") or {}).get("amount")
+        if precision_amount is not None:
+            precision_decimal = Decimal(str(precision_amount))
+            if precision_decimal > 0:
+                if precision_decimal >= 1:
+                    step = Decimal(1).scaleb(-int(precision_decimal))
+                else:
+                    step = precision_decimal
+
+    if step is not None:
+        contract_size = market.get("contractSize")
+        if contract_size is not None:
+            step = step * Decimal(str(contract_size))
+        return step
+    return None
 
 
 def _round_amount_up_to_step(raw_amount: Decimal, step: Decimal | None) -> Decimal:
@@ -257,12 +268,23 @@ def _amount_from_notional(exchange, symbol: str, notional_usdt: Decimal, last_pr
     # between sizing and submission.
     target_notional *= Decimal("1.01")
 
-    raw_amount = target_notional / last_price
-    raw_amount = _round_amount_up_to_step(raw_amount, _market_amount_step(market))
-    amount = exchange.amount_to_precision(symbol, float(raw_amount))
-    if Decimal(str(amount)) <= 0:
+    raw_amount_base = target_notional / last_price
+    step_base = _market_amount_step(market)
+    raw_amount_base = _round_amount_up_to_step(raw_amount_base, step_base)
+
+    if exchange.id == "okx":
+        contract_size = Decimal(str(market.get("contractSize") or 1))
+        contracts = raw_amount_base / contract_size
+        contracts_str = exchange.amount_to_precision(symbol, float(contracts))
+        amount_base = Decimal(contracts_str) * contract_size
+        amount = str(amount_base)
+    else:
+        amount = exchange.amount_to_precision(symbol, float(raw_amount_base))
+        amount_base = Decimal(amount)
+
+    if amount_base <= 0:
         raise RuntimeError(f"Calculated amount is not positive: {amount}")
-    return amount, Decimal(str(amount)) * last_price
+    return amount, amount_base * last_price
 
 
 def _fetch_position_summary(exchange, symbol: str) -> None:

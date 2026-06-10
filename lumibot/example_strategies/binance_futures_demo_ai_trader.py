@@ -88,6 +88,8 @@ RUNTIME_CONFIG_PROTECTED_KEYS = {
 }
 _PROCESS_LOCK_HANDLE: Any | None = None
 _ACCOUNT_NOT_PROVIDED: Any = object()
+_GEMINI_CLIENTS: dict[str, Any] = {}
+_OPENAI_CLIENTS: dict[tuple[str, str | None, float], Any] = {}
 RUNTIME_CONFIG_HOT_KEYS = {
     "new_entries_enabled",
     "emergency_close_positions",
@@ -1140,6 +1142,7 @@ def _decision_prompt(
                 "action must be BUY, SELL, HOLD, or CLOSE. "
                 "Use BUY or SELL only if there is a strong trend-aligned signal from indicators and experts. "
                 "Use CLOSE if current_position has_position is true and a clear reversal signal is present. "
+                "Avoid repeating bad entry setups described in recent_reviews. "
                 "Otherwise, return HOLD. "
                 "Do not wrap the JSON in markdown. "
                 "Example: {\"action\": \"HOLD\", \"confidence\": 0.95, \"reason\": \"...\"}"
@@ -1158,6 +1161,7 @@ def _decision_prompt(
             "market_regime": _regime_payload(regime),
             "expert_signals": _signal_payload(expert_signals),
             "current_position": position_payload,
+            "recent_reviews": recent_reviews[-3:],
         }
         return prompt
 
@@ -1253,6 +1257,7 @@ def _decision_prompt(
 
 
 def _gemini_completion_text(model_name: str, prompt: dict[str, Any], temperature: float, max_output_tokens: int) -> str:
+    global _GEMINI_CLIENTS
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY for Gemini model.")
@@ -1260,7 +1265,10 @@ def _gemini_completion_text(model_name: str, prompt: dict[str, Any], temperature
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    if api_key not in _GEMINI_CLIENTS:
+        _GEMINI_CLIENTS[api_key] = genai.Client(api_key=api_key)
+    client = _GEMINI_CLIENTS[api_key]
+
     response = client.models.generate_content(
         model=model_name,
         contents=json.dumps(prompt),
@@ -1282,6 +1290,7 @@ def _openai_compatible_completion_text(
     *,
     provider: str = "openai",
 ) -> str:
+    global _OPENAI_CLIENTS
     if provider == "qwen":
         base_url = (
             os.environ.get("QWEN_OPENAI_COMPATIBLE_BASE_URL")
@@ -1303,13 +1312,15 @@ def _openai_compatible_completion_text(
     if not api_key:
         raise RuntimeError(missing_key_error)
 
-    from openai import OpenAI
+    client_key = (api_key, base_url, timeout_seconds)
+    if client_key not in _OPENAI_CLIENTS:
+        from openai import OpenAI
+        client_args: dict[str, Any] = {"api_key": api_key, "timeout": timeout_seconds}
+        if base_url:
+            client_args["base_url"] = base_url
+        _OPENAI_CLIENTS[client_key] = OpenAI(**client_args)
+    client = _OPENAI_CLIENTS[client_key]
 
-    client_args: dict[str, Any] = {"api_key": api_key, "timeout": timeout_seconds}
-    if base_url:
-        client_args["base_url"] = base_url
-
-    client = OpenAI(**client_args)
     prompt_text = (
         "Analyze this non-null trading payload. "
         "If current_position.has_position is false, the account is flat; do not treat that as missing input. "
@@ -1332,16 +1343,33 @@ def _openai_compatible_completion_text(
         "max_tokens": max_output_tokens,
     }
     if provider == "qwen" or "qwen" in model_name.lower():
-        completion_args["extra_body"] = {"enable_thinking": False}
+        if "thinking" in model_name.lower():
+            completion_args["extra_body"] = {"enable_thinking": True}
+        else:
+            completion_args["extra_body"] = {"enable_thinking": False}
+
+    # Enable stream=True to prevent Gemini/Web proxy connections from getting stuck
+    completion_args["stream"] = True
 
     response = client.chat.completions.create(**completion_args)
-    choices = getattr(response, "choices", None) or []
-    if not choices:
-        return ""
-    message = getattr(choices[0], "message", None)
-    if message is None:
-        return ""
-    return getattr(message, "content", "") or ""
+    if not hasattr(response, "__iter__"):
+        # Fallback for non-iterable response mocks in unit tests
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return ""
+        message = getattr(choices[0], "message", None)
+        if message is None:
+            return ""
+        return getattr(message, "content", "") or ""
+
+    full_text = ""
+    for chunk in response:
+        choices = getattr(chunk, "choices", None) or []
+        if choices:
+            delta = getattr(choices[0], "delta", None)
+            content = getattr(delta, "content", "") or ""
+            full_text += content
+    return full_text.strip()
 
 
 def _ai_completion_text(
@@ -3491,8 +3519,10 @@ def _maybe_auto_tune_parameters(state: dict[str, Any], args: argparse.Namespace)
     reasons: list[str] = []
     if win_rate < Decimal("0.40") or profit_factor < Decimal("0.90"):
         min_confidence += Decimal("0.05")
-        stop_loss_pct *= Decimal("0.90")
-        take_profit_pct *= Decimal("1.10")
+        # Do not tighten stop-loss to avoid the death spiral.
+        # Slightly widen the stop-loss and tighten the take profit target.
+        stop_loss_pct *= Decimal("1.05")
+        take_profit_pct *= Decimal("0.90")
         trailing_activation_pct *= Decimal("0.90")
         trailing_distance_pct *= Decimal("0.90")
         symbol_cooldown_minutes *= Decimal("1.25")
@@ -3507,8 +3537,9 @@ def _maybe_auto_tune_parameters(state: dict[str, Any], args: argparse.Namespace)
         reasons.append("relaxed_after_positive_recent_performance")
 
     if losses and avg_loss > avg_win and avg_win > 0:
-        stop_loss_pct *= Decimal("0.90")
-        take_profit_pct *= Decimal("1.05")
+        # Prevent tightening stop-loss on losses to avoid death spiral.
+        # Slightly tighten take-profit target to secure wins sooner.
+        take_profit_pct *= Decimal("0.95")
         reasons.append("improved_reward_risk_after_large_average_loss")
 
     overrides = {
@@ -3703,6 +3734,7 @@ def _maybe_record_external_close(
     previous_symbol = previous_open_trade.get("symbol")
     if previous_symbol and previous_symbol != symbol:
         return
+
     position = _position_from_open_trade(previous_open_trade)
     if position is None:
         return
@@ -3727,6 +3759,26 @@ def _maybe_record_external_close(
         previous_open_trade,
         binance_report=binance_income,
     )
+
+    if getattr(args, "review_trades", True):
+        try:
+            print(f"[External Close Review] Fetching market state to review external close of {symbol}...")
+            candles = exchange.fetch_ohlcv(symbol, args.timeframe, limit=args.candle_limit)
+            indicators = _calculate_indicators(candles, args.ema_fast, args.ema_slow)
+            timeframe_indicators = _fetch_timeframe_indicators(exchange, symbol, args, indicators)
+            _review_closed_trade(
+                state,
+                args,
+                symbol,
+                position,
+                last_price,
+                "EXTERNAL_OR_NATIVE_CLOSE",
+                previous_open_trade,
+                indicators,
+                timeframe_indicators,
+            )
+        except Exception as exc:
+            print(f"Failed to generate review for external close: {exc}")
 
 
 def _maybe_print_performance_report(state: dict[str, Any], args: argparse.Namespace, equity: Decimal) -> None:
@@ -4649,7 +4701,8 @@ def _close_position(
         if price <= 0 and order.get("id"):
             try:
                 since_ms = int(time.time() * 1000) - 30000
-                trades = exchange.fetch_my_trades(symbol, since=since_ms, limit=10)
+                raw_trades = exchange.fetch_my_trades(symbol, since=since_ms, limit=10)
+                trades = [_normalize_trade(exchange, symbol, t) for t in raw_trades or []]
                 order_trades = [t for t in trades if t.get("order") == order["id"]]
                 if order_trades:
                     total_price_volume = sum(_decimal(t.get("price") or 0) * _decimal(t.get("amount") or 0) for t in order_trades)
@@ -4923,19 +4976,36 @@ def _amount_from_notional_with_cap(
         return amount, estimated_notional
 
     market = exchange.markets[symbol]
-    max_amount = max_notional_usdt / last_price
-    step = _market_amount_step(market)
-    if step is not None and step > 0:
-        max_amount = (max_amount / step).to_integral_value(rounding=ROUND_DOWN) * step
+    max_amount_base = max_notional_usdt / last_price
+    step_base = _market_amount_step(market)
+    if step_base is not None and step_base > 0:
+        max_amount_base = (max_amount_base / step_base).to_integral_value(rounding=ROUND_DOWN) * step_base
 
-    capped_amount = exchange.amount_to_precision(symbol, float(max_amount))
-    capped_notional = Decimal(str(capped_amount)) * last_price
-    while step is not None and step > 0 and capped_notional > max_notional_usdt and Decimal(str(capped_amount)) > step:
-        max_amount = Decimal(str(capped_amount)) - step
-        capped_amount = exchange.amount_to_precision(symbol, float(max_amount))
-        capped_notional = Decimal(str(capped_amount)) * last_price
+    if exchange.id == "okx":
+        contract_size = Decimal(str(market.get("contractSize") or 1))
+        contracts = max_amount_base / contract_size
+        capped_contracts = exchange.amount_to_precision(symbol, float(contracts))
+        capped_amount_base = Decimal(capped_contracts) * contract_size
+        capped_amount = str(capped_amount_base)
+    else:
+        capped_amount = exchange.amount_to_precision(symbol, float(max_amount_base))
+        capped_amount_base = Decimal(capped_amount)
 
-    if Decimal(str(capped_amount)) <= 0:
+    capped_notional = capped_amount_base * last_price
+    while step_base is not None and step_base > 0 and capped_notional > max_notional_usdt and capped_amount_base > step_base:
+        max_amount_base = capped_amount_base - step_base
+        if exchange.id == "okx":
+            contract_size = Decimal(str(market.get("contractSize") or 1))
+            contracts = max_amount_base / contract_size
+            capped_contracts = exchange.amount_to_precision(symbol, float(contracts))
+            capped_amount_base = Decimal(capped_contracts) * contract_size
+            capped_amount = str(capped_amount_base)
+        else:
+            capped_amount = exchange.amount_to_precision(symbol, float(max_amount_base))
+            capped_amount_base = Decimal(capped_amount)
+        capped_notional = capped_amount_base * last_price
+
+    if capped_amount_base <= 0:
         raise RuntimeError(f"Calculated capped amount is not positive: {capped_amount}")
     return capped_amount, capped_notional
 

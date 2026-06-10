@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.5.48 - 2026-06-10
+
+### Added
+- **Enable Qwen reasoning/thinking capability.** When using reasoning-capable Qwen models (e.g., `qwen3.7-max-thinking`), the strategy now enables thinking (`"enable_thinking": True` in `extra_body`) instead of suppressing it.
+
+### Fixed
+- **Corrected OKX contract sizing and rounding mismatch.** Fixed contract precision rounding bugs for derivative markets on OKX (where order amounts are denominated in contracts rather than base currency units).
+- **Corrected trade sync quantity normalization.** Unified trade object normalization when fetching trades to avoid contract-to-base quantity logging mismatch in closed trades.
+
+### Changed
+- **Persistent LLM API client caching.** Caches OpenAI and Gemini Clients globally to avoid client creation overhead and socket/resource leaks on every strategy iteration.
+
 ## 4.5.47 - 2026-06-05
 
 Deploy marker: `e51a0478`

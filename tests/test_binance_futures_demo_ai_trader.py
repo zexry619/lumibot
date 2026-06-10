@@ -948,6 +948,8 @@ def test_gemini_decision_can_use_openai_compatible_primary(monkeypatch):
 
 
 def test_openai_compatible_qwen_request_disables_thinking(monkeypatch):
+    from lumibot.example_strategies.binance_futures_demo_ai_trader import _OPENAI_CLIENTS
+    _OPENAI_CLIENTS.clear()
     calls = []
 
     class FakeCompletions:
@@ -986,7 +988,19 @@ def test_openai_compatible_qwen_request_disables_thinking(monkeypatch):
     assert calls[0]["client"]["base_url"] == "http://127.0.0.1:7860/v1"
     assert calls[0]["client"]["api_key"] == "qwen-key"
     assert calls[1]["model"] == "qwen3.7-max-thinking"
-    assert calls[1]["extra_body"] == {"enable_thinking": False}
+    assert calls[1]["extra_body"] == {"enable_thinking": True}
+
+    # Test that a non-thinking Qwen model disables thinking
+    _openai_compatible_completion_text(
+        "qwen-max",
+        {"context": "test"},
+        0.2,
+        100,
+        30,
+        provider="qwen",
+    )
+    assert calls[2]["model"] == "qwen-max"
+    assert calls[2]["extra_body"] == {"enable_thinking": False}
 
 
 def test_shadow_decision_comparison_records_but_keeps_final_decision(monkeypatch):
@@ -1721,8 +1735,8 @@ def test_auto_tune_parameters_tightens_after_weak_recent_trades(monkeypatch):
 
     overrides = state["auto_tune_overrides"]
     assert Decimal(overrides["min_confidence"]) > Decimal("0.70")
-    assert Decimal(overrides["stop_loss_pct"]) < Decimal("1.0")
-    assert Decimal(overrides["take_profit_pct"]) > Decimal("1.2")
+    assert Decimal(overrides["stop_loss_pct"]) > Decimal("1.0")
+    assert Decimal(overrides["take_profit_pct"]) < Decimal("1.2")
     assert _symbol_entry_block_reason(state, "BTC/USDT:USDT").startswith("symbol temporarily blacklisted until")
 
 
