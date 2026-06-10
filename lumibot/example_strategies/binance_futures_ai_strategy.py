@@ -139,8 +139,11 @@ class BinanceFuturesAIStrategy(Strategy):
     def on_trading_iteration(self) -> None:
         try:
             runtime_changed = _safe_hot_reload_runtime_config(self.args, self.state)
-            _apply_lessons_learned_thresholds(self.args, self.state)
+            if runtime_changed:
+                self.state.pop("auto_tune_overrides", None)
+                self.state.pop("lessons_learned_overrides", None)
             auto_override_changed = _apply_auto_tune_overrides(self.args, self.state)
+            _apply_lessons_learned_thresholds(self.args, self.state)
             _maybe_auto_tune_parameters(self.state, self.args)
             auto_override_changed = _apply_auto_tune_overrides(self.args, self.state) or auto_override_changed
             if auto_override_changed:

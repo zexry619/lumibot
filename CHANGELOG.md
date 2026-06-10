@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.5.49 - 2026-06-10
+
+### Fixed
+- **Resolved clashing between auto-tune and lessons-learned overrides.** Adjusted override application order so that lessons-learned evolved thresholds (like min_confidence and entry_aggressiveness) are not wiped out by old auto-tune overrides. Lessons-learned thresholds are now fed directly into the auto-tune baseline.
+- **Fixed hot-reload override reset bug.** Ensured that any manual runtime configuration changes from hot-reloads properly reset historical auto-tune and lessons-learned overrides so that new user parameters are immediately applied.
+
 ## 4.5.48 - 2026-06-10
 
 ### Added
