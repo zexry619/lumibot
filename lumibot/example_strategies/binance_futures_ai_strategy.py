@@ -46,6 +46,8 @@ from lumibot.example_strategies.binance_futures_demo_ai_trader import (
     _maybe_auto_tune_parameters,
     _sync_binance_performance,
     _validate_args,
+    _snapshot_args,
+    _restore_args,
     parse_args,
 )
 from lumibot.strategies.strategy import Strategy
@@ -135,13 +137,16 @@ class BinanceFuturesAIStrategy(Strategy):
         self.dual_side = _fetch_dual_side_position(self.exchange)
         self.log_message(f"Position mode: {'hedge' if self.dual_side else 'one-way'}")
         self.state = _load_state(self.args.state_file)
+        self.baseline_snapshot = _snapshot_args(self.args)
 
     def on_trading_iteration(self) -> None:
         try:
+            _restore_args(self.args, self.baseline_snapshot)
             runtime_changed = _safe_hot_reload_runtime_config(self.args, self.state)
             if runtime_changed:
                 self.state.pop("auto_tune_overrides", None)
                 self.state.pop("lessons_learned_overrides", None)
+                self.baseline_snapshot = _snapshot_args(self.args)
             auto_override_changed = _apply_auto_tune_overrides(self.args, self.state)
             _apply_lessons_learned_thresholds(self.args, self.state)
             _maybe_auto_tune_parameters(self.state, self.args)

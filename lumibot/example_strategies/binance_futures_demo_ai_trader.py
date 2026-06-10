@@ -7495,12 +7495,15 @@ def main() -> int:
     print(f"Position mode: {'hedge' if dual_side else 'one-way'}")
 
     state = _load_state(args.state_file)
+    baseline_snapshot = _snapshot_args(args)
     while True:
         try:
+            _restore_args(args, baseline_snapshot)
             runtime_changed = _safe_hot_reload_runtime_config(args, state)
             if runtime_changed:
                 state.pop("auto_tune_overrides", None)
                 state.pop("lessons_learned_overrides", None)
+                baseline_snapshot = _snapshot_args(args)
             auto_override_changed = _apply_auto_tune_overrides(args, state)
             _apply_lessons_learned_thresholds(args, state)
             _maybe_auto_tune_parameters(state, args)

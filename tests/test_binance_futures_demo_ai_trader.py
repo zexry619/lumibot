@@ -3089,5 +3089,32 @@ def test_fetch_position_v2_account_zero_position_returns_none():
 
     assert _fetch_position(exchange, "BTC/USDT:USDT") is None
     assert exchange.fetch_positions_called is False
-    _global_entry_block_reason,
-    _record_trade_outcome,
+
+
+def test_snapshot_args_and_restore_args():
+    from lumibot.example_strategies.binance_futures_demo_ai_trader import (
+        _snapshot_args,
+        _restore_args,
+    )
+    import argparse
+    args = argparse.Namespace(
+        min_confidence=Decimal("0.70"),
+        stop_loss_pct=Decimal("1.00"),
+        other_param="test",
+    )
+    snapshot = _snapshot_args(args)
+
+    # Mutate args
+    args.min_confidence = Decimal("0.88")
+    args.stop_loss_pct = Decimal("1.50")
+    args.other_param = "modified"
+    args.new_param = "extra"
+
+    # Restore args
+    _restore_args(args, snapshot)
+
+    # Verify they are restored back to the original values
+    assert args.min_confidence == Decimal("0.70")
+    assert args.stop_loss_pct == Decimal("1.00")
+    assert args.other_param == "test"
+    assert not hasattr(args, "new_param")
