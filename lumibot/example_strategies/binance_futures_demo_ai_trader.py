@@ -805,6 +805,18 @@ def _parse_model_spec(model: str) -> AIModelSpec:
             if not parsed_model:
                 raise RuntimeError(f"Qwen OpenAI-compatible model spec {raw!r} is missing a model name")
             return AIModelSpec(provider="qwen", model=parsed_model, raw=raw)
+    for prefix in ("deepseek:", "deepseek/"):
+        if lowered.startswith(prefix):
+            parsed_model = raw[len(prefix) :].strip()
+            if not parsed_model:
+                raise RuntimeError(f"Deepseek model spec {raw!r} is missing a model name")
+            return AIModelSpec(provider="deepseek", model=parsed_model, raw=raw)
+    for prefix in ("localgpt:", "localgpt/"):
+        if lowered.startswith(prefix):
+            parsed_model = raw[len(prefix) :].strip()
+            if not parsed_model:
+                raise RuntimeError(f"LocalGPT model spec {raw!r} is missing a model name")
+            return AIModelSpec(provider="localgpt", model=parsed_model, raw=raw)
     for prefix in ("openai-compatible:", "openai-compatible/", "openai:", "openai/"):
         if lowered.startswith(prefix):
             parsed_model = raw[len(prefix) :].strip()
@@ -1303,6 +1315,14 @@ def _openai_compatible_completion_text(
             or os.environ.get("QWEN_API_KEY")
         )
         missing_key_error = "Missing QWEN_OPENAI_COMPATIBLE_API_KEY or QWEN_API_KEY for Qwen advisor model."
+    elif provider == "deepseek":
+        base_url = os.environ.get("DEEPSEEK_BASE_URL") or "http://127.0.0.1:22217/v1"
+        api_key = os.environ.get("DEEPSEEK_API_KEY") or "sk-admin"
+        missing_key_error = "Missing DEEPSEEK_API_KEY for Deepseek model."
+    elif provider == "localgpt":
+        base_url = os.environ.get("LOCALGPT_BASE_URL") or "http://127.0.0.1:5005/v1"
+        api_key = os.environ.get("LOCALGPT_API_KEY") or "EMPTY"
+        missing_key_error = "Missing LOCALGPT_API_KEY for LocalGPT model."
     else:
         base_url = os.environ.get("OPENAI_COMPATIBLE_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
         api_key = os.environ.get("OPENAI_COMPATIBLE_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -1348,28 +1368,17 @@ def _openai_compatible_completion_text(
         else:
             completion_args["extra_body"] = {"enable_thinking": False}
 
-    # Enable stream=True to prevent Gemini/Web proxy connections from getting stuck
-    completion_args["stream"] = True
+    # Disable streaming to avoid server-side JSON unmarshaling errors observed on some providers like Qwen.
+    completion_args["stream"] = False
 
     response = client.chat.completions.create(**completion_args)
-    if not hasattr(response, "__iter__"):
-        # Fallback for non-iterable response mocks in unit tests
-        choices = getattr(response, "choices", None) or []
-        if not choices:
-            return ""
-        message = getattr(choices[0], "message", None)
-        if message is None:
-            return ""
-        return getattr(message, "content", "") or ""
-
-    full_text = ""
-    for chunk in response:
-        choices = getattr(chunk, "choices", None) or []
-        if choices:
-            delta = getattr(choices[0], "delta", None)
-            content = getattr(delta, "content", "") or ""
-            full_text += content
-    return full_text.strip()
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return ""
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        return ""
+    return getattr(message, "content", "") or ""
 
 
 def _ai_completion_text(
@@ -1383,6 +1392,24 @@ def _ai_completion_text(
         return _gemini_completion_text(spec.model, prompt, temperature, max_output_tokens)
     if spec.provider == "openai":
         return _openai_compatible_completion_text(spec.model, prompt, temperature, max_output_tokens, timeout_seconds)
+    if spec.provider == "deepseek":
+        return _openai_compatible_completion_text(
+            spec.model,
+            prompt,
+            temperature,
+            max_output_tokens,
+            timeout_seconds,
+            provider="deepseek",
+        )
+    if spec.provider == "localgpt":
+        return _openai_compatible_completion_text(
+            spec.model,
+            prompt,
+            temperature,
+            max_output_tokens,
+            timeout_seconds,
+            provider="localgpt",
+        )
     if spec.provider == "qwen":
         return _openai_compatible_completion_text(
             spec.model,
@@ -2711,6 +2738,12 @@ def _auto_tune_baseline(state: dict[str, Any], args: argparse.Namespace) -> dict
         "min_reward_to_fee_ratio",
         "max_entry_funding_cost_pct",
         "ai_entry_aggressiveness",
+        "dynamic_exit_min_stop_pct",
+        "dynamic_exit_max_stop_pct",
+        "dynamic_exit_min_take_profit_pct",
+        "dynamic_exit_max_take_profit_pct",
+        "dynamic_exit_atr_stop_multiplier",
+        "dynamic_exit_min_reward_risk",
     ):
         if hasattr(args, key):
             baseline[key] = str(getattr(args, key))
@@ -2740,6 +2773,31 @@ def _apply_lessons_learned_thresholds(args: argparse.Namespace, state: dict[str,
     overrides = state.get("lessons_learned_overrides")
     if not isinstance(overrides, dict):
         return
+
+    # Decay lessons learned overrides back toward baseline if time has passed since the last loss
+    last_loss_ts = _decimal(state.get("lessons_learned_last_loss_ts", "0"))
+    if last_loss_ts > 0:
+        now = _now_ts()
+        elapsed_hours = (now - last_loss_ts) / Decimal("3600")
+        if elapsed_hours > Decimal("0.1"):  # Decay at least every 6 minutes
+            # Decay min_confidence back down to args.min_confidence (or config baseline)
+            baseline_conf = Decimal(str(args.min_confidence))
+            current_conf = Decimal(str(overrides.get("min_confidence", baseline_conf)))
+            if current_conf > baseline_conf:
+                decay_rate = Decimal("0.005")  # decays 0.02 in 4 hours
+                new_conf = max(baseline_conf, current_conf - decay_rate * elapsed_hours)
+                overrides["min_confidence"] = str(new_conf)
+
+            # Decay ai_entry_aggressiveness back up to args.ai_entry_aggressiveness
+            baseline_agg = Decimal(str(args.ai_entry_aggressiveness))
+            current_agg = Decimal(str(overrides.get("ai_entry_aggressiveness", baseline_agg)))
+            if current_agg < baseline_agg:
+                decay_rate_agg = Decimal("0.01")  # decays 0.05 in 5 hours
+                new_agg = min(baseline_agg, current_agg + decay_rate_agg * elapsed_hours)
+                overrides["ai_entry_aggressiveness"] = str(new_agg)
+                
+            state["lessons_learned_last_loss_ts"] = str(now)
+
     applied = []
     for key, val in overrides.items():
         if hasattr(args, key):
@@ -3467,24 +3525,49 @@ def _maybe_auto_tune_parameters(state: dict[str, Any], args: argparse.Namespace)
     idle_overrides, idle_reasons = _idle_auto_tune_overrides(state, args, baseline, now)
     lookback = int(getattr(args, "auto_tune_lookback_trades", 30))
     trades = _closed_trade_pnls(state, lookback)
+
+    # Cooldown check for performance-based tuning
+    cooldown_hours = getattr(args, "auto_tune_cooldown_hours", Decimal("4"))
+    last_adjustment = _decimal(state.get("auto_tune_last_adjustment_ts", "0"))
+    in_cooldown = cooldown_hours > 0 and last_adjustment > 0 and now - last_adjustment < cooldown_hours * Decimal("3600")
+
     min_trades = int(getattr(args, "auto_tune_min_trades", 8))
-    if len(trades) < min_trades:
-        if idle_overrides:
-            _write_auto_tune_summary(
-                state,
-                auto_state,
-                now,
-                idle_overrides,
-                {
-                    "mode": "idle",
-                    "trades": len(trades),
-                    "min_trades": min_trades,
-                    "reasons": idle_reasons,
-                    "overrides": idle_overrides,
-                },
-                args,
-            )
-        return
+    if len(trades) < min_trades or in_cooldown:
+        if in_cooldown and len(trades) >= min_trades:
+            # We are in cooldown, don't perform performance tuning, but if idle overrides exist, we can still write them.
+            if idle_overrides:
+                _write_auto_tune_summary(
+                    state,
+                    auto_state,
+                    now,
+                    idle_overrides,
+                    {
+                        "mode": "idle_under_cooldown",
+                        "trades": len(trades),
+                        "reasons": idle_reasons,
+                        "overrides": idle_overrides,
+                    },
+                    args,
+                )
+            return
+            
+        if len(trades) < min_trades:
+            if idle_overrides:
+                _write_auto_tune_summary(
+                    state,
+                    auto_state,
+                    now,
+                    idle_overrides,
+                    {
+                        "mode": "idle",
+                        "trades": len(trades),
+                        "min_trades": min_trades,
+                        "reasons": idle_reasons,
+                        "overrides": idle_overrides,
+                    },
+                    args,
+                )
+            return
 
     pnl_values = [pnl for _trade, pnl in trades]
     wins = [pnl for pnl in pnl_values if pnl > 0]
@@ -3516,6 +3599,13 @@ def _maybe_auto_tune_parameters(state: dict[str, Any], args: argparse.Namespace)
         default=str(args.loss_symbol_cooldown_minutes),
     )
 
+    # Dynamic exit parameters
+    dynamic_exit_min_stop_pct = _decimal(baseline.get("dynamic_exit_min_stop_pct"), default=str(args.dynamic_exit_min_stop_pct))
+    dynamic_exit_max_stop_pct = _decimal(baseline.get("dynamic_exit_max_stop_pct"), default=str(args.dynamic_exit_max_stop_pct))
+    dynamic_exit_min_take_profit_pct = _decimal(baseline.get("dynamic_exit_min_take_profit_pct"), default=str(args.dynamic_exit_min_take_profit_pct))
+    dynamic_exit_max_take_profit_pct = _decimal(baseline.get("dynamic_exit_max_take_profit_pct"), default=str(args.dynamic_exit_max_take_profit_pct))
+    dynamic_exit_atr_stop_multiplier = _decimal(baseline.get("dynamic_exit_atr_stop_multiplier"), default=str(args.dynamic_exit_atr_stop_multiplier))
+
     reasons: list[str] = []
     if win_rate < Decimal("0.40") or profit_factor < Decimal("0.90"):
         min_confidence += Decimal("0.05")
@@ -3523,6 +3613,14 @@ def _maybe_auto_tune_parameters(state: dict[str, Any], args: argparse.Namespace)
         # Slightly widen the stop-loss and tighten the take profit target.
         stop_loss_pct *= Decimal("1.05")
         take_profit_pct *= Decimal("0.90")
+        
+        # Scale dynamic exit parameters as well
+        dynamic_exit_min_stop_pct *= Decimal("1.05")
+        dynamic_exit_max_stop_pct *= Decimal("1.05")
+        dynamic_exit_atr_stop_multiplier *= Decimal("1.05")
+        dynamic_exit_min_take_profit_pct *= Decimal("0.90")
+        dynamic_exit_max_take_profit_pct *= Decimal("0.90")
+
         trailing_activation_pct *= Decimal("0.90")
         trailing_distance_pct *= Decimal("0.90")
         symbol_cooldown_minutes *= Decimal("1.25")
@@ -3532,15 +3630,35 @@ def _maybe_auto_tune_parameters(state: dict[str, Any], args: argparse.Namespace)
         min_confidence -= Decimal("0.03")
         stop_loss_pct *= Decimal("1.05")
         take_profit_pct *= Decimal("1.05")
+
+        # Scale dynamic exit parameters as well
+        dynamic_exit_min_stop_pct *= Decimal("1.05")
+        dynamic_exit_max_stop_pct *= Decimal("1.05")
+        dynamic_exit_atr_stop_multiplier *= Decimal("1.05")
+        dynamic_exit_min_take_profit_pct *= Decimal("1.05")
+        dynamic_exit_max_take_profit_pct *= Decimal("1.05")
+
         trailing_activation_pct *= Decimal("1.05")
         trailing_distance_pct *= Decimal("1.05")
         reasons.append("relaxed_after_positive_recent_performance")
 
-    if losses and avg_loss > avg_win and avg_win > 0:
-        # Prevent tightening stop-loss on losses to avoid death spiral.
-        # Slightly tighten take-profit target to secure wins sooner.
-        take_profit_pct *= Decimal("0.95")
-        reasons.append("improved_reward_risk_after_large_average_loss")
+    # Enforce R:R floor guard on both fixed and dynamic parameters:
+    min_rr = getattr(args, "auto_tune_min_reward_risk", Decimal("1.50"))
+    
+    # 1. Fixed parameters R:R floor guard
+    if stop_loss_pct > 0 and (take_profit_pct / stop_loss_pct) < min_rr:
+        take_profit_pct = stop_loss_pct * min_rr
+        reasons.append("fixed_take_profit_adjusted_by_rr_floor_guard")
+        
+    # 2. Dynamic limits R:R floor guard
+    if dynamic_exit_max_stop_pct > 0 and (dynamic_exit_min_take_profit_pct / dynamic_exit_max_stop_pct) < min_rr:
+        dynamic_exit_min_take_profit_pct = dynamic_exit_max_stop_pct * min_rr
+        reasons.append("dynamic_min_take_profit_adjusted_by_rr_floor_guard")
+        
+    # Enforce dynamic_exit_min_reward_risk floor
+    dynamic_exit_min_reward_risk = _decimal(baseline.get("dynamic_exit_min_reward_risk"), default=str(args.dynamic_exit_min_reward_risk))
+    if dynamic_exit_min_reward_risk < min_rr:
+        dynamic_exit_min_reward_risk = min_rr
 
     overrides = {
         "min_confidence": str(_clamp_decimal(min_confidence, Decimal("0.60"), Decimal("0.88"))),
@@ -3550,7 +3668,26 @@ def _maybe_auto_tune_parameters(state: dict[str, Any], args: argparse.Namespace)
         "trailing_distance_pct": str(_clamp_decimal(trailing_distance_pct, Decimal("0.20"), Decimal("0.80"))),
         "symbol_cooldown_minutes": str(_clamp_decimal(symbol_cooldown_minutes, Decimal("5"), Decimal("120"))),
         "loss_symbol_cooldown_minutes": str(_clamp_decimal(loss_symbol_cooldown_minutes, Decimal("15"), Decimal("360"))),
+        "dynamic_exit_min_stop_pct": str(_clamp_decimal(dynamic_exit_min_stop_pct, Decimal("0.20"), Decimal("1.20"))),
+        "dynamic_exit_max_stop_pct": str(_clamp_decimal(dynamic_exit_max_stop_pct, Decimal("0.50"), Decimal("2.00"))),
+        "dynamic_exit_min_take_profit_pct": str(_clamp_decimal(dynamic_exit_min_take_profit_pct, Decimal("0.50"), Decimal("2.50"))),
+        "dynamic_exit_max_take_profit_pct": str(_clamp_decimal(dynamic_exit_max_take_profit_pct, Decimal("1.50"), Decimal("5.00"))),
+        "dynamic_exit_atr_stop_multiplier": str(_clamp_decimal(dynamic_exit_atr_stop_multiplier, Decimal("1.00"), Decimal("3.50"))),
+        "dynamic_exit_min_reward_risk": str(_clamp_decimal(dynamic_exit_min_reward_risk, Decimal("1.20"), Decimal("4.00"))),
     }
+
+    # Check if overrides changed compared to existing overrides
+    prev_overrides = state.get("auto_tune_overrides") or {}
+    changed = False
+    for k, v in overrides.items():
+        if prev_overrides.get(k) != v:
+            changed = True
+            break
+            
+    if changed:
+        state["auto_tune_last_adjustment_ts"] = str(now)
+        reasons.append("parameters_adjusted")
+
     if idle_overrides:
         if "tightened_after_weak_recent_performance" not in reasons:
             overrides.update(idle_overrides)
@@ -3606,14 +3743,14 @@ def _maybe_auto_tune_parameters(state: dict[str, Any], args: argparse.Namespace)
         now,
         overrides,
         {
-        "mode": "performance",
-        "trades": len(pnl_values),
-        "win_rate": str(win_rate),
-        "profit_factor": str(profit_factor),
-        "gross_win": str(gross_win),
-        "gross_loss": str(gross_loss),
-        "reasons": reasons,
-        "overrides": overrides,
+            "mode": "performance",
+            "trades": len(pnl_values),
+            "win_rate": str(win_rate),
+            "profit_factor": str(profit_factor),
+            "gross_win": str(gross_win),
+            "gross_loss": str(gross_loss),
+            "reasons": reasons,
+            "overrides": overrides,
         },
         args,
     )
@@ -5854,6 +5991,9 @@ def _review_closed_trade(
         agg = Decimal(str(overrides.get("ai_entry_aggressiveness", args.ai_entry_aggressiveness)))
         agg = max(agg - Decimal("0.05"), Decimal("0.20"))
         overrides["ai_entry_aggressiveness"] = str(agg)
+
+        # Record last loss timestamp for decay-to-baseline logic
+        state["lessons_learned_last_loss_ts"] = str(_now_ts())
 
         # NOTE: Stop-loss tightening after losses removed to prevent death spiral.
         # Tighter stops cause more stop-outs, leading to more losses, leading to even tighter stops.
