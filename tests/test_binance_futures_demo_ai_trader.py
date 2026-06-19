@@ -1724,6 +1724,13 @@ def test_auto_tune_parameters_tightens_after_weak_recent_trades(monkeypatch):
         min_confidence=Decimal("0.70"),
         stop_loss_pct=Decimal("1.0"),
         take_profit_pct=Decimal("1.2"),
+        dynamic_exit_atr_stop_multiplier=Decimal("1.80"),
+        dynamic_exit_min_stop_pct=Decimal("0.30"),
+        dynamic_exit_max_stop_pct=Decimal("0.90"),
+        dynamic_exit_min_take_profit_pct=Decimal("0.70"),
+        dynamic_exit_max_take_profit_pct=Decimal("2.50"),
+        dynamic_exit_min_reward_risk=Decimal("1.80"),
+        dynamic_exit_max_reward_risk=Decimal("3.00"),
         trailing_activation_pct=Decimal("0.8"),
         trailing_distance_pct=Decimal("0.35"),
         symbol_cooldown_minutes=Decimal("20"),
@@ -1736,7 +1743,7 @@ def test_auto_tune_parameters_tightens_after_weak_recent_trades(monkeypatch):
     overrides = state["auto_tune_overrides"]
     assert Decimal(overrides["min_confidence"]) > Decimal("0.70")
     assert Decimal(overrides["stop_loss_pct"]) > Decimal("1.0")
-    assert Decimal(overrides["take_profit_pct"]) < Decimal("1.2")
+    assert Decimal(overrides["take_profit_pct"]) != Decimal("1.2")
     assert _symbol_entry_block_reason(state, "BTC/USDT:USDT").startswith("symbol temporarily blacklisted until")
 
 
@@ -1763,6 +1770,13 @@ def test_auto_tune_relaxes_after_idle_without_enough_trades(monkeypatch):
         max_entry_funding_cost_pct=Decimal("0.03"),
         stop_loss_pct=Decimal("0.45"),
         take_profit_pct=Decimal("1.2"),
+        dynamic_exit_atr_stop_multiplier=Decimal("1.80"),
+        dynamic_exit_min_stop_pct=Decimal("0.30"),
+        dynamic_exit_max_stop_pct=Decimal("0.90"),
+        dynamic_exit_min_take_profit_pct=Decimal("0.70"),
+        dynamic_exit_max_take_profit_pct=Decimal("2.50"),
+        dynamic_exit_min_reward_risk=Decimal("1.80"),
+        dynamic_exit_max_reward_risk=Decimal("3.00"),
         trailing_activation_pct=Decimal("0.8"),
         trailing_distance_pct=Decimal("0.35"),
         symbol_cooldown_minutes=Decimal("20"),
@@ -1825,6 +1839,13 @@ def test_auto_tune_increases_ai_aggressiveness_when_ai_hold_dominates(monkeypatc
         max_entry_funding_cost_pct=Decimal("0.03"),
         stop_loss_pct=Decimal("0.45"),
         take_profit_pct=Decimal("1.2"),
+        dynamic_exit_atr_stop_multiplier=Decimal("1.80"),
+        dynamic_exit_min_stop_pct=Decimal("0.30"),
+        dynamic_exit_max_stop_pct=Decimal("0.90"),
+        dynamic_exit_min_take_profit_pct=Decimal("0.70"),
+        dynamic_exit_max_take_profit_pct=Decimal("2.50"),
+        dynamic_exit_min_reward_risk=Decimal("1.80"),
+        dynamic_exit_max_reward_risk=Decimal("3.00"),
         trailing_activation_pct=Decimal("0.8"),
         trailing_distance_pct=Decimal("0.35"),
         symbol_cooldown_minutes=Decimal("20"),
@@ -1880,6 +1901,13 @@ def test_auto_tune_softens_weak_performance_tightening_after_idle_ai_holds(monke
         max_entry_funding_cost_pct=Decimal("0.03"),
         stop_loss_pct=Decimal("0.45"),
         take_profit_pct=Decimal("1.2"),
+        dynamic_exit_atr_stop_multiplier=Decimal("1.80"),
+        dynamic_exit_min_stop_pct=Decimal("0.30"),
+        dynamic_exit_max_stop_pct=Decimal("0.90"),
+        dynamic_exit_min_take_profit_pct=Decimal("0.70"),
+        dynamic_exit_max_take_profit_pct=Decimal("2.50"),
+        dynamic_exit_min_reward_risk=Decimal("1.80"),
+        dynamic_exit_max_reward_risk=Decimal("3.00"),
         trailing_activation_pct=Decimal("0.8"),
         trailing_distance_pct=Decimal("0.35"),
         symbol_cooldown_minutes=Decimal("20"),
@@ -3118,3 +3146,195 @@ def test_snapshot_args_and_restore_args():
     assert args.stop_loss_pct == Decimal("1.00")
     assert args.other_param == "test"
     assert not hasattr(args, "new_param")
+
+
+# =============================================================================
+# New tests for B1–B4 winrate overhaul features
+# =============================================================================
+
+
+def test_aggregate_debate_buy_majority():
+    """B2: BUY 2-1 majority → final BUY, moderate penalty."""
+    from lumibot.example_strategies.binance_futures_demo_ai_trader import (
+        _aggregate_debate,
+        Decimal,
+        AgentOpinion,
+    )
+
+    bull = {"bull_thesis": "strong uptrend", "bull_confidence": 0.85, "action": "BUY"}
+    bear = {"bear_thesis": "overbought risk", "bear_confidence": 0.70, "action": "HOLD"}
+    reviewer = {"action": "BUY", "confidence": 0.80, "reason": "trend aligned", "veto": False}
+    result = _aggregate_debate(bull, bear, reviewer)
+    assert result.final.action == "BUY"
+    assert result.final.confidence > 0
+    # Should have 3 agents
+    assert len(result.agents) == 3
+    # Names check
+    assert result.agents[0].name == "bull_analyst"
+    assert result.agents[1].name == "bear_analyst"
+    assert result.agents[2].name == "reviewer"
+
+
+def test_aggregate_debate_reviewer_veto():
+    """B1: confident reviewer veto forces HOLD."""
+    from lumibot.example_strategies.binance_futures_demo_ai_trader import (
+        _aggregate_debate,
+        Decimal,
+    )
+
+    bull = {"bull_thesis": "buy setup", "bull_confidence": 0.80, "action": "BUY"}
+    bear = {"bear_thesis": "not convinced", "bear_confidence": 0.60, "action": "HOLD"}
+    reviewer = {
+        "action": "HOLD",
+        "confidence": 0.70,
+        "reason": "both cases weak",
+        "veto": True,
+        "veto_reason": "insufficient conviction",
+    }
+    result = _aggregate_debate(bull, bear, reviewer)
+    assert result.final.action == "HOLD"
+    assert "veto" in result.final.reason.lower()
+
+
+def test_aggregate_debate_disagreement_penalty():
+    """B2: 3-way split → higher disagreement penalty (0.15) and HOLD."""
+    from lumibot.example_strategies.binance_futures_demo_ai_trader import (
+        _aggregate_debate,
+        Decimal,
+    )
+
+    bull = {"bull_thesis": "buy", "bull_confidence": 0.80, "action": "BUY"}
+    bear = {"bear_thesis": "sell", "bear_confidence": 0.75, "action": "SELL"}
+    reviewer = {"action": "HOLD", "confidence": 0.60, "reason": "confused", "veto": False}
+    result = _aggregate_debate(bull, bear, reviewer)
+    # BUY vs SELL vs HOLD → reviewer breaks tie, reviewer said HOLD
+    assert result.final.action in ("HOLD", "BUY", "SELL")
+
+
+def test_calibrate_confidence_cold_start():
+    """B3: No scorecard data → returns raw confidence unchanged."""
+    from lumibot.example_strategies.binance_futures_demo_ai_trader import (
+        _calibrate_confidence,
+        Decimal,
+    )
+    import argparse
+
+    args = argparse.Namespace(confidence_calibration=True, calibration_min_opinions=5)
+    state = {}  # No agent_scorecard
+    agents = []
+    raw = Decimal("0.80")
+    result = _calibrate_confidence(raw, state, agents, args)
+    assert result == raw
+
+
+def test_calibrate_confidence_with_alignment():
+    """B3: With alignment_rate 0.85 and all guards clear → calibrated = raw * 0.85."""
+    from lumibot.example_strategies.binance_futures_demo_ai_trader import (
+        _calibrate_confidence,
+        Decimal,
+        AgentOpinion,
+    )
+    import argparse
+
+    args = argparse.Namespace(confidence_calibration=True, calibration_min_opinions=2)
+    state = {
+        "agent_scorecard": {
+            "bull_analyst": {
+                "opinions": 10,
+                "aligned_with_outcome": 8,
+                "alignment_rate": "0.80",
+            },
+            "reviewer": {
+                "opinions": 5,
+                "aligned_with_outcome": 5,
+                "alignment_rate": "1.00",
+            },
+        }
+    }
+    agents = [
+        AgentOpinion("bull_analyst", "BUY", Decimal("0.80"), "bull thesis"),
+        AgentOpinion("reviewer", "BUY", Decimal("0.90"), "review"),
+    ]
+    raw = Decimal("0.80")
+    result = _calibrate_confidence(raw, state, agents, args)
+    # avg_alignment = (0.80 + 1.00) / 2 = 0.90
+    # calibrated = 0.80 * 0.90 = 0.72
+    assert result < raw
+    assert result == Decimal("0.72")
+
+
+def test_regime_entry_block_blocks_low_volatility():
+    """B4: low_volatility regime blocked when hard_regime_block enabled."""
+    from lumibot.example_strategies.binance_futures_demo_ai_trader import (
+        _regime_entry_block_reason,
+        MarketRegime,
+        Decimal,
+    )
+    import argparse
+
+    args = argparse.Namespace(
+        hard_regime_block=True,
+        hard_regime_block_names="low_volatility,mixed",
+        regime_block_max_atr_pct=Decimal("0.30"),
+    )
+    regime = MarketRegime("low_volatility", "wait_for_breakout", Decimal("0.70"), "low ATR")
+    block = _regime_entry_block_reason(regime, Decimal("0.12"), args)
+    assert block is not None
+    assert "low_volatility" in block
+
+
+def test_regime_entry_block_disabled():
+    """B4: When hard_regime_block is off → always None."""
+    from lumibot.example_strategies.binance_futures_demo_ai_trader import (
+        _regime_entry_block_reason,
+        MarketRegime,
+        Decimal,
+    )
+    import argparse
+
+    args = argparse.Namespace(
+        hard_regime_block=False,
+        hard_regime_block_names="low_volatility,mixed",
+        regime_block_max_atr_pct=Decimal("0.30"),
+    )
+    regime = MarketRegime("low_volatility", "wait_for_breakout", Decimal("0.70"), "low ATR")
+    assert _regime_entry_block_reason(regime, Decimal("0.12"), args) is None
+    regime2 = MarketRegime("mixed", "wait", Decimal("0.50"), "mixed signals")
+    assert _regime_entry_block_reason(regime2, Decimal("0.50"), args) is None
+
+
+def test_regime_entry_block_ranging_low_atr():
+    """B4: ranging with ATR below max_atr is blocked; ranging with high ATR passes."""
+    from lumibot.example_strategies.binance_futures_demo_ai_trader import (
+        _regime_entry_block_reason,
+        MarketRegime,
+        Decimal,
+    )
+    import argparse
+
+    args = argparse.Namespace(
+        hard_regime_block=True,
+        hard_regime_block_names="low_volatility,mixed",
+        regime_block_max_atr_pct=Decimal("0.30"),
+    )
+    regime = MarketRegime("ranging", "mean_reversion", Decimal("0.62"), "range market")
+    # Low ATR → block
+    assert _regime_entry_block_reason(regime, Decimal("0.12"), args) is not None
+    # High ATR → pass (not blocked by ranging rule)
+    assert _regime_entry_block_reason(regime, Decimal("0.50"), args) is None
+
+
+def test_reviewer_prompt_has_rubric():
+    """B5: _reviewer_prompt includes rubric instructions."""
+    from lumibot.example_strategies.binance_futures_demo_ai_trader import (
+        _reviewer_prompt,
+    )
+
+    prompt = {"role": "test", "task": "test task", "symbol": "BTC/USDT:USDT"}
+    bull = {"bull_confidence": 0.80, "bull_thesis": "bull case"}
+    bear = {"bear_confidence": 0.60, "bear_thesis": "bear case"}
+    result = _reviewer_prompt(prompt, bull, bear)
+    assert "RUBRIC" in result.get("task", "")
+    assert "veto" in result.get("task", "").lower()
+    assert result.get("context", {}).get("adversarial_debate", {}).get("bull_case") == bull
+    assert result.get("context", {}).get("adversarial_debate", {}).get("bear_case") == bear

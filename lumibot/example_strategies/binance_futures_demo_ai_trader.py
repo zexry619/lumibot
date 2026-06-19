@@ -34,6 +34,7 @@ import time
 import sqlite3
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
@@ -196,6 +197,15 @@ RUNTIME_CONFIG_HOT_KEYS = {
     "discord_webhook_url",
     "telegram_bot_token",
     "telegram_chat_id",
+    "parallel_debate",
+    "confidence_calibration",
+    "calibration_min_opinions",
+    "hard_regime_block",
+    "hard_regime_block_names",
+    "regime_block_max_atr_pct",
+    "ai_close_min_loss_pct",
+    "ai_close_required_reversal_timeframes",
+    "ai_close_min_confidence",
 }
 LARGE_CAP_USDM_BASES = (
     "BTC",
@@ -1429,6 +1439,50 @@ def _effective_multi_agent_decision(decision: MultiAgentDecision) -> EffectiveDe
     return EffectiveDecision(decision.final)
 
 
+def _calibrate_confidence(
+    raw_confidence: Decimal,
+    state: dict[str, Any],
+    agents: list[AgentOpinion],
+    args: argparse.Namespace,
+) -> Decimal:
+    """Calibrate raw LLM confidence using the agent_scorecard (B3).
+
+    The scorecard tracks each agent's historical alignment_rate (how often its
+    action matched the trade outcome). confidence_calibrated = raw *
+    alignment_rate, with an extra surcharge penalty when agents are
+    anti-calibrated (alignment < 0.40). Opt-in: returns raw unchanged until
+    enough opinions exist (cold-start safe), so legacy tests are unaffected.
+    """
+    if not getattr(args, "confidence_calibration", False):
+        return raw_confidence
+    scorecard = state.get("agent_scorecard")
+    if not isinstance(scorecard, dict) or not scorecard:
+        return raw_confidence
+    min_opinions = int(getattr(args, "calibration_min_opinions", 5))
+    rates: list[Decimal] = []
+    for agent in agents:
+        stats = scorecard.get(agent.name)
+        if not isinstance(stats, dict):
+            continue
+        opinions = int(_decimal(stats.get("opinions")))
+        if opinions < min_opinions:
+            continue
+        rate = _decimal(stats.get("alignment_rate"))
+        if rate > 0:
+            rates.append(rate)
+    if not rates:
+        return raw_confidence
+    avg_alignment = sum(rates) / Decimal(len(rates))
+    calibrated = raw_confidence * avg_alignment
+    if avg_alignment < Decimal("0.40"):
+        calibrated = calibrated * Decimal("0.75")
+    if calibrated < 0:
+        return Decimal("0")
+    if calibrated > 1:
+        return Decimal("1")
+    return calibrated
+
+
 def _bull_case_prompt(prompt: dict[str, Any]) -> dict[str, Any]:
     bull_prompt = dict(prompt)
     bull_prompt["role"] = "You are a highly biased crypto Bull Analyst."
@@ -1467,6 +1521,194 @@ def _bear_case_prompt(prompt: dict[str, Any]) -> dict[str, Any]:
     return bear_prompt
 
 
+def _reviewer_prompt(
+    prompt: dict[str, Any],
+    bull_json: dict[str, Any],
+    bear_json: dict[str, Any],
+) -> dict[str, Any]:
+    reviewer_prompt = dict(prompt)
+    reviewer_prompt["role"] = "You are the final Reviewer for a crypto futures trading committee."
+    reviewer_prompt["task"] = (
+        "You are given a Bull case and a Bear case for the same symbol. Make the FINAL decision. "
+        "Return only JSON with keys: action, confidence, reason, veto (boolean), veto_reason (string or null). "
+        "action must be BUY, SELL, HOLD, or CLOSE. confidence must be 0.0 to 1.0. "
+        "RUBRIC (mandatory): "
+        "(1) confidence must be JUSTIFIED by specific indicator values (EMA stack, RSI, ATR, multi-timeframe "
+        "alignment) cited in reason; do NOT return confidence >=0.80 unless trend alignment is strong on >=2 "
+        "timeframes AND deterministic risk gates are clear. "
+        "(2) If the Bull and Bear cases conflict and market_regime is mixed, ranging, or low_volatility, return HOLD. "
+        "(3) Set veto=true ONLY when both cases are weak or contradictory and you are confident (>=0.65) that no "
+        "trade should be taken; this forces the system to HOLD. "
+        "(4) Prefer HOLD over a low-conviction BUY/SELL. A bad no-trade is far cheaper than a bad trade. "
+        "Do not wrap in markdown or add prose."
+    )
+    reviewer_prompt = dict(reviewer_prompt)
+    context = reviewer_prompt.get("context")
+    if not isinstance(context, dict):
+        context = {}
+    reviewer_prompt["context"] = {
+        **context,
+        "adversarial_debate": {
+            "bull_case": bull_json,
+            "bear_case": bear_json,
+        },
+    }
+    return reviewer_prompt
+
+
+def _debate_case_action(case_json: dict[str, Any], directional_action: str) -> str:
+    action = str(case_json.get("action") or "").upper()
+    if action in {"BUY", "SELL", "HOLD", "CLOSE"}:
+        return action
+    conf = _ai_decimal(case_json.get("bull_confidence") or case_json.get("bear_confidence") or case_json.get("confidence") or 0)
+    return directional_action if conf >= Decimal("0.60") else "HOLD"
+
+
+def _debate_case_confidence(case_json: dict[str, Any]) -> Decimal:
+    conf = _ai_decimal(case_json.get("bull_confidence") or case_json.get("bear_confidence") or case_json.get("confidence") or 0)
+    if conf < 0:
+        return Decimal("0")
+    if conf > 1:
+        return Decimal("1")
+    return conf
+
+
+def _aggregate_debate(
+    bull_json: dict[str, Any],
+    bear_json: dict[str, Any],
+    reviewer_json: dict[str, Any],
+) -> MultiAgentDecision:
+    """Aggregate parallel Bull/Bear/Reviewer cases into one decision (B2).
+
+    Uses majority voting instead of trusting raw LLM confidence, and applies a
+    disagreement penalty. The Reviewer holds a real veto (B1): a confident
+    veto forces HOLD. This replaces the single-call 6-agent role-play whose
+    "agents" were one LLM call pretending to be a committee.
+    """
+    bull_action = _debate_case_action(bull_json, "BUY")
+    bear_action = _debate_case_action(bear_json, "SELL")
+    reviewer_action = str(reviewer_json.get("action") or "HOLD").upper()
+    if reviewer_action not in {"BUY", "SELL", "HOLD", "CLOSE"}:
+        reviewer_action = "HOLD"
+
+    bull_conf = _debate_case_confidence(bull_json)
+    bear_conf = _debate_case_confidence(bear_json)
+    reviewer_conf = _debate_case_confidence(reviewer_json)
+
+    agents = [
+        AgentOpinion("bull_analyst", bull_action, bull_conf, str(bull_json.get("bull_thesis") or bull_json.get("reason") or "")[:300]),
+        AgentOpinion("bear_analyst", bear_action, bear_conf, str(bear_json.get("bear_thesis") or bear_json.get("reason") or "")[:300]),
+        AgentOpinion("reviewer", reviewer_action, reviewer_conf, str(reviewer_json.get("reason") or "")[:300]),
+    ]
+
+    # Reviewer veto: a confident veto forces HOLD (real advisor veto, B1).
+    if bool(reviewer_json.get("veto")) and reviewer_action == "HOLD" and reviewer_conf >= Decimal("0.65"):
+        veto_reason = str(reviewer_json.get("veto_reason") or reviewer_json.get("reason") or "reviewer veto")[:300]
+        return MultiAgentDecision(
+            final=AIDecision("HOLD", Decimal("0"), f"Reviewer veto: {veto_reason}"),
+            agents=agents,
+        )
+
+    votes = [bull_action, bear_action, reviewer_action]
+    tallies: dict[str, int] = {}
+    for vote in votes:
+        tallies[vote] = tallies.get(vote, 0) + 1
+    buy_count = tallies.get("BUY", 0)
+    sell_count = tallies.get("SELL", 0)
+
+    if buy_count >= 2 and sell_count == 0:
+        final_action = "BUY"
+    elif sell_count >= 2 and buy_count == 0:
+        final_action = "SELL"
+    elif reviewer_action in {"BUY", "SELL"}:
+        # Reviewer breaks a BUY-vs-SELL tie or a 1-1-1 split.
+        final_action = reviewer_action
+    elif buy_count == 1 and sell_count == 0:
+        final_action = "BUY"
+    elif sell_count == 1 and buy_count == 0:
+        final_action = "SELL"
+    else:
+        final_action = "HOLD"
+
+    # Disagreement penalty (B2): raw LLM confidence is not trusted directly.
+    distinct = len({bull_action, bear_action, reviewer_action})
+    if distinct == 1:
+        penalty = Decimal("0")
+    elif distinct == 2:
+        penalty = Decimal("0.08")
+    else:
+        penalty = Decimal("0.15")
+
+    aligned_confs = [
+        conf
+        for act, conf in ((bull_action, bull_conf), (bear_action, bear_conf), (reviewer_action, reviewer_conf))
+        if act == final_action and conf > 0
+    ]
+    weighted_avg = sum(aligned_confs) / Decimal(len(aligned_confs)) if aligned_confs else Decimal("0.5")
+    confidence = weighted_avg - penalty
+    if confidence < 0:
+        confidence = Decimal("0")
+    if confidence > 1:
+        confidence = Decimal("1")
+
+    reason = (
+        f"Parallel debate vote: bull={bull_action} bear={bear_action} reviewer={reviewer_action} "
+        f"-> {final_action} (disagreement_penalty={penalty}). {reviewer_json.get('reason', '')}"
+    )[:500]
+
+    return MultiAgentDecision(
+        final=AIDecision(final_action, confidence, reason),
+        agents=agents,
+    )
+
+
+def _parallel_debate_decision(
+    prompt: dict[str, Any],
+    model_chain: list[str],
+    max_retries: int,
+    retry_delay_seconds: float,
+    request_timeout_seconds: float,
+) -> MultiAgentDecision:
+    """Run Bull/Bear/Reviewer LLM calls and aggregate by vote (B1).
+
+    Bull and Bear run in parallel; the Reviewer runs after (it reviews both
+    cases). Raises on exhaustion so the caller can fall back to a single-call
+    decision.
+    """
+    attempts = max(1, max_retries + 1)
+    spec = _parse_model_spec(model_chain[0]) if model_chain else _parse_model_spec(DEFAULT_MODEL)
+    display_name = _model_display_name(spec)
+
+    bull_prompt = _bull_case_prompt(prompt)
+    bear_prompt = _bear_case_prompt(prompt)
+
+    def _call(prompt_obj: dict[str, Any], max_tokens: int) -> dict[str, Any]:
+        text = _ai_completion_text(spec, prompt_obj, temperature=0.2, max_output_tokens=max_tokens, timeout_seconds=request_timeout_seconds)
+        return json.loads(_strip_json_fence(text))
+
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            print(f"Parallel debate request: model={display_name} attempt={attempt}/{attempts}")
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_bull = pool.submit(_call, bull_prompt, 300)
+                fut_bear = pool.submit(_call, bear_prompt, 300)
+                bull_json = fut_bull.result()
+                bear_json = fut_bear.result()
+            reviewer_prompt = _reviewer_prompt(prompt, bull_json, bear_json)
+            reviewer_json = _call(reviewer_prompt, 600)
+            return _aggregate_debate(bull_json, bear_json, reviewer_json)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts and _should_retry_ai_error(exc):
+                print(f"Parallel debate failed: {exc}; retrying.")
+                time.sleep(retry_delay_seconds * attempt)
+                continue
+            break
+
+    raise RuntimeError(f"Parallel debate exhausted: {last_exc}")
+
+
 def _gemini_decision(
     models: list[str] | str,
     indicators: Indicators,
@@ -1483,6 +1725,7 @@ def _gemini_decision(
     entry_aggressiveness: Decimal = Decimal("0.50"),
     context_payload: dict[str, Any] | None = None,
     adversarial_debate: bool = False,
+    parallel_debate: bool = False,
     is_screener: bool = False,
 ) -> MultiAgentDecision:
     model_chain = [models] if isinstance(models, str) else list(models)
@@ -1502,6 +1745,15 @@ def _gemini_decision(
         context_payload,
         is_screener=is_screener,
     )
+
+    # B1: parallel 3-way debate (Bull/Bear/Reviewer) replaces the single-call
+    # 6-agent role-play for new entries. Falls back to the single-call path
+    # below on any failure.
+    if parallel_debate and position is None and not is_screener:
+        try:
+            return _parallel_debate_decision(prompt, model_chain, max_retries, retry_delay_seconds, request_timeout_seconds)
+        except Exception as exc:
+            print(f"Parallel debate unavailable ({exc}); falling back to single-call multi-agent decision.")
 
     if adversarial_debate and position is None:
         try:
@@ -5255,6 +5507,11 @@ def _create_native_protection_orders(
             "side": close_side.upper(),
             "workingType": str(base_params.get("workingType", "MARK_PRICE")),
             "closePosition": "true",
+            # priceProtect rejects STOP/TP triggers outside a sane price band,
+            # which limits the worst-case fill slippage on fast funding/news moves.
+            # Observed leak: 14 trades lost more than the 0.80% stop (worst -3.84%)
+            # because the market STOP_MARKET filled wherever the book was.
+            "priceProtect": "true",
         }
         if "positionSide" in base_params:
             algo_base_params["positionSide"] = base_params["positionSide"]
@@ -5313,6 +5570,7 @@ def _create_native_protection_orders(
         {
             **base_params,
             "stopPrice": stop_price,
+            "priceProtect": True,
         },
     )
     take_profit_order = exchange.create_order(
@@ -5324,6 +5582,7 @@ def _create_native_protection_orders(
         {
             **base_params,
             "stopPrice": take_profit_price,
+            "priceProtect": True,
         },
     )
     return stop_order, take_profit_order
@@ -5523,7 +5782,12 @@ def _maybe_reprice_native_protection(
         f"Native protection reprice for {symbol}: stop {current_stop}->{desired_stop} "
         f"take_profit {current_take_profit}->{desired_take_profit}"
     )
-    _cancel_open_algo_orders(exchange, symbol)
+    # CRITICAL FIX (stop-leak): place new protection FIRST. Only cancel the old
+    # orders after the new ones are confirmed live. Previously this cancelled
+    # first and then placed, so a placement failure left the position with NO
+    # hard exchange stop (only the per-tick software check), which is how trades
+    # blew far past the 0.80% stop (worst observed -3.84%). A brief overlap of
+    # two conditional close-position orders is far safer than a naked position.
     protection = _place_native_protection_prices(
         exchange,
         symbol,
@@ -5536,8 +5800,32 @@ def _maybe_reprice_native_protection(
         dual_side,
     )
     if not protection:
-        print(f"Native protection reprice failed for {symbol}; software exits remain active.")
+        print(
+            f"Native protection reprice FAILED for {symbol}; keeping existing stop "
+            f"(stop={current_stop} take_profit={current_take_profit}). Software exits remain active."
+        )
+        _record_trade_journal_event(
+            state,
+            "native_protection_reprice_failed",
+            {
+                "symbol": symbol,
+                "side": position.side,
+                "reason": "new placement failed; old protection preserved",
+                "attempted_stop_price": str(desired_stop),
+                "attempted_take_profit_price": str(desired_take_profit),
+                "kept_stop_price": str(current_stop),
+                "kept_take_profit_price": str(current_take_profit),
+            },
+        )
         return False
+    # New protection is live — now safe to tear down the old algo orders.
+    try:
+        _cancel_open_algo_orders(exchange, symbol)
+    except ccxt.BaseError as exc:
+        # New orders are already placed; a cancel failure here just means a
+        # duplicate conditional order may exist, which the exchange (or the next
+        # _ensure_native_protection pass) will reconcile. Do not treat as fatal.
+        print(f"Native protection reprice: old-order cancel failed for {symbol} (new orders live): {exc}")
     open_trade["native_protection"] = protection
     open_trade["last_native_reprice_ts"] = str(now)
     open_trade["last_native_reprice_reason"] = "tighten_stop_or_take_profit"
@@ -5747,6 +6035,40 @@ def _funding_entry_block_reason(exchange, args: argparse.Namespace, symbol: str,
     return None
 
 
+def _regime_entry_block_reason(
+    regime: MarketRegime,
+    atr_pct: Decimal,
+    args: argparse.Namespace,
+) -> str | None:
+    """Hard block new entries in choppy/non-trending regimes (B4).
+
+    low_volatility, mixed, and ranging-with-low-ATR markets are where the
+    strategy bled winrate via false breakouts and whipsaws. This is a hard
+    deterministic gate (not a soft prompt hint) so the AI cannot override it.
+    """
+    if not getattr(args, "hard_regime_block", False):
+        return None
+    blocked_names = {
+        name.strip()
+        for name in str(getattr(args, "hard_regime_block_names", "")).split(",")
+        if name.strip()
+    }
+    if regime.name in blocked_names:
+        return f"hard regime block: regime={regime.name} ({regime.reason})"
+    regime_block_max_atr_pct = _decimal(getattr(args, "regime_block_max_atr_pct", "0.30"))
+    if (
+        regime.name == "ranging"
+        and regime_block_max_atr_pct > 0
+        and atr_pct > 0
+        and atr_pct <= regime_block_max_atr_pct
+    ):
+        return (
+            f"hard regime block: regime=ranging with low ATR ({atr_pct:.3f}% <= "
+            f"{regime_block_max_atr_pct}%); chop risk"
+        )
+    return None
+
+
 def _entry_notional_from_risk(
     args: argparse.Namespace,
     equity: Decimal,
@@ -5915,6 +6237,70 @@ def _breakeven_or_trailing_action(
             return ExitAction("TRAILING_STOP", trailing_stop)
         if open_trade.get("breakeven_armed") and last_price >= breakeven_stop:
             return ExitAction("BREAKEVEN_STOP", breakeven_stop)
+    return None
+
+
+def _reversed_timeframe_count(
+    position: PositionSummary,
+    timeframe_indicators: dict[str, Indicators],
+) -> int:
+    """Count how many timeframes have trended AGAINST the open position.
+
+    A long is "reversed" on a timeframe whose trend is "down"; a short is
+    reversed on a "up" trend. "flat" timeframes do not count as reversal
+    confirmation.
+    """
+    against = "down" if position.side == "long" else "up"
+    return sum(1 for ind in timeframe_indicators.values() if ind.trend == against)
+
+
+def _unrealized_pnl_pct(position: PositionSummary, last_price: Decimal) -> Decimal:
+    """Realized-style move from entry to last_price, as a percent of entry."""
+    if position.entry_price <= 0:
+        return Decimal("0")
+    if position.side == "long":
+        return (last_price - position.entry_price) / position.entry_price * Decimal("100")
+    return (position.entry_price - last_price) / position.entry_price * Decimal("100")
+
+
+def _ai_close_guard_reason(
+    position: PositionSummary,
+    last_price: Decimal,
+    timeframe_indicators: dict[str, Indicators],
+    args: argparse.Namespace,
+) -> str | None:
+    """Veto an AI CLOSE that is not actually justified.
+
+    Honors an AI CLOSE only when at least one of these holds:
+      1. The unrealized loss is already significant (>= ai_close_min_loss_pct),
+         so closing caps the damage rather than locking a trivial loss; OR
+      2. A genuine multi-timeframe reversal has confirmed against the position
+         (>= ai_close_required_reversal_timeframes timeframes trending against).
+
+    Otherwise returns a blocking reason. This is what lifted the AI_CLOSE
+    winrate floor — previously the AI could close any position at >=0.65
+    confidence, which produced a 20% winrate bucket of small locked-in losses.
+    """
+    if position.entry_price <= 0:
+        return None
+
+    min_loss_pct = _decimal(getattr(args, "ai_close_min_loss_pct", "0.30"), default="0.30")
+    required_reversals = int(getattr(args, "ai_close_required_reversal_timeframes", 2) or 2)
+
+    pnl_pct = _unrealized_pnl_pct(position, last_price)
+    reversed_count = _reversed_timeframe_count(position, timeframe_indicators)
+
+    # Profitable (or breakeven-ish) positions: require a real reversal.
+    if pnl_pct > -min_loss_pct:
+        if reversed_count < required_reversals:
+            return (
+                f"position still near breakeven/profit (pnl_pct={pnl_pct:.3f}% "
+                f"> -{min_loss_pct}% floor) with only {reversed_count}/{required_reversals} "
+                f"required reversal timeframes; let deterministic stop manage it"
+            )
+        return None
+
+    # Loss is significant beyond the floor: AI CLOSE is justified to cap damage.
     return None
 
 
@@ -6662,6 +7048,12 @@ def _run_iteration(
         return state
 
     if position is None:
+        regime_block = _regime_entry_block_reason(regime, indicators.atr_pct, args)
+        if regime_block:
+            print(f"Blocked: {regime_block}.")
+            _record_entry_block(state, symbol, "regime_block", regime_block)
+            return state
+
         account_position_block = _account_position_block_reason(exchange, args, symbol, position, account)
         if account_position_block:
             print(f"Blocked: {account_position_block}.")
@@ -6772,6 +7164,7 @@ def _run_iteration(
                     getattr(args, "ai_entry_aggressiveness", Decimal("0.50")),
                     ai_context,
                     adversarial_debate=getattr(args, "adversarial_debate", False),
+                    parallel_debate=getattr(args, "parallel_debate", False),
                 )
             except Exception as exc:
                 if args.allow_fallback:
@@ -6815,7 +7208,12 @@ def _run_iteration(
         )
     effective_decision = _effective_multi_agent_decision(multi_agent_decision)
     decision = effective_decision.decision
-    print(f"AI decision: action={decision.action} confidence={decision.confidence} reason={decision.reason}")
+    calibrated_conf = _calibrate_confidence(decision.confidence, state, multi_agent_decision.agents, args)
+    if calibrated_conf != decision.confidence:
+        decision = AIDecision(decision.action, calibrated_conf, decision.reason, decision.entry_plan)
+        print(f"AI decision (calibrated): action={decision.action} confidence={decision.confidence} reason={decision.reason}")
+    else:
+        print(f"AI decision: action={decision.action} confidence={decision.confidence} reason={decision.reason}")
     shadow_comparisons = _shadow_decision_comparisons(
         args,
         state,
@@ -6833,7 +7231,7 @@ def _run_iteration(
     advisor_comparisons = []
 
     if decision.action == "CLOSE" and position:
-        min_close_confidence = Decimal("0.65")
+        min_close_confidence = _decimal(getattr(args, "ai_close_min_confidence", "0.72"), default="0.72")
         if decision.confidence < min_close_confidence:
             print(
                 f"AI CLOSE blocked: confidence {decision.confidence} < min_close_confidence {min_close_confidence}. "
@@ -6841,6 +7239,28 @@ def _run_iteration(
             )
             _record_entry_block(state, symbol, "ai_close_low_confidence", f"confidence {decision.confidence} < {min_close_confidence}")
             return state
+
+        # CRITICAL FIX (AI_CLOSE winrate was 20%): the AI was locking in small
+        # losses whenever it spotted a reversal, even when the loss was trivial
+        # or the trend was still aligned. Now we only honor an AI CLOSE when it
+        # is actually justified: either the loss is significant (beyond the
+        # floor) OR a genuine multi-timeframe reversal has confirmed against the
+        # position. Otherwise treat as HOLD and let the deterministic
+        # stop/breakeven handle it.
+        close_side_guard = _ai_close_guard_reason(
+            position,
+            last_price,
+            timeframe_indicators,
+            args,
+        )
+        if close_side_guard:
+            print(
+                f"AI CLOSE blocked by profit/reversal guard: {close_side_guard}. Treating as HOLD "
+                f"(unrealized_pnl={position.unrealized_pnl})."
+            )
+            _record_entry_block(state, symbol, "ai_close_guard", close_side_guard)
+            return state
+
         close_execution = _close_position(exchange, symbol, position, dual_side, args.execute)
         close_time_ms = _now_ms()
         close_price = _close_execution_price(close_execution, last_price)
@@ -7362,6 +7782,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dynamic-protection-reprice-interval-minutes", type=_nonnegative_decimal, default=Decimal("10"))
     parser.add_argument("--dynamic-protection-min-improvement-pct", type=_nonnegative_decimal, default=Decimal("0.05"))
+    parser.add_argument(
+        "--parallel-debate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run Bull/Bear/Reviewer LLM calls in parallel and aggregate by vote instead of a single role-play call.",
+    )
+    parser.add_argument(
+        "--confidence-calibration",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Calibrate raw LLM confidence against the agent_scorecard alignment_rate (B3).",
+    )
+    parser.add_argument("--calibration-min-opinions", type=int, default=5, help="Minimum agent opinions before confidence calibration applies.")
+    parser.add_argument(
+        "--hard-regime-block",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Hard block new entries in choppy/non-trending regimes (B4); the AI cannot override this.",
+    )
+    parser.add_argument("--hard-regime-block-names", default="low_volatility,mixed", help="Comma-separated regime names to hard-block for new entries.")
+    parser.add_argument("--regime-block-max-atr-pct", type=_nonnegative_decimal, default=Decimal("0.30"), help="Block 'ranging' regime entries when ATR%% is at or below this.")
+    parser.add_argument("--ai-close-min-loss-pct", type=_nonnegative_decimal, default=Decimal("0.30"), help="Minimum unrealized loss %% before an AI CLOSE is honored without a confirmed reversal.")
+    parser.add_argument("--ai-close-required-reversal-timeframes", type=int, default=2, help="Higher timeframes that must trend against the position before an AI CLOSE is honored near breakeven.")
+    parser.add_argument("--ai-close-min-confidence", type=_positive_decimal, default=Decimal("0.72"), help="Minimum AI CLOSE confidence to act (A3).")
     parser.add_argument(
         "--ai-entry-plan",
         action=argparse.BooleanOptionalAction,
