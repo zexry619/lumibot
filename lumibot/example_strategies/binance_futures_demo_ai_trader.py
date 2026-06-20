@@ -1682,21 +1682,28 @@ def _parallel_debate_decision(
     bull_prompt = _bull_case_prompt(prompt)
     bear_prompt = _bear_case_prompt(prompt)
 
-    def _call(prompt_obj: dict[str, Any], max_tokens: int) -> dict[str, Any]:
-        text = _ai_completion_text(spec, prompt_obj, temperature=0.2, max_output_tokens=max_tokens, timeout_seconds=request_timeout_seconds)
-        return json.loads(_strip_json_fence(text))
+    def _call(prompt_obj: dict[str, Any], max_tokens: int, label: str = "") -> dict[str, Any]:
+        try:
+            text = _ai_completion_text(spec, prompt_obj, temperature=0.2, max_output_tokens=max_tokens, timeout_seconds=request_timeout_seconds)
+            return json.loads(_strip_json_fence(text))
+        except Exception:
+            if label == "bull":
+                return {"bull_confidence": 0, "bull_thesis": "parse_failure", "action": "HOLD"}
+            if label == "bear":
+                return {"bear_confidence": 0, "bear_thesis": "parse_failure", "action": "HOLD"}
+            return {"action": "HOLD", "confidence": 0, "reason": "parse_failure", "veto": False}
 
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
             print(f"Parallel debate request: model={display_name} attempt={attempt}/{attempts}")
             with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_bull = pool.submit(_call, bull_prompt, 300)
-                fut_bear = pool.submit(_call, bear_prompt, 300)
+                fut_bull = pool.submit(_call, bull_prompt, 300, "bull")
+                fut_bear = pool.submit(_call, bear_prompt, 300, "bear")
                 bull_json = fut_bull.result()
                 bear_json = fut_bear.result()
             reviewer_prompt = _reviewer_prompt(prompt, bull_json, bear_json)
-            reviewer_json = _call(reviewer_prompt, 600)
+            reviewer_json = _call(reviewer_prompt, 600, "reviewer")
             return _aggregate_debate(bull_json, bear_json, reviewer_json)
         except Exception as exc:
             last_exc = exc
