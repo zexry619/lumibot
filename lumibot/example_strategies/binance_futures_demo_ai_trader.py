@@ -1635,7 +1635,7 @@ def _aggregate_debate(
     if distinct == 1:
         penalty = Decimal("0")
     elif distinct == 2:
-        penalty = Decimal("0.08")
+        penalty = Decimal("0.04")
     else:
         penalty = Decimal("0.15")
 
@@ -3913,6 +3913,13 @@ def _maybe_auto_tune_parameters(state: dict[str, Any], args: argparse.Namespace)
     if dynamic_exit_max_stop_pct > 0 and (dynamic_exit_min_take_profit_pct / dynamic_exit_max_stop_pct) < min_rr:
         dynamic_exit_min_take_profit_pct = dynamic_exit_max_stop_pct * min_rr
         reasons.append("dynamic_min_take_profit_adjusted_by_rr_floor_guard")
+        
+    # Enforce min_take_profit_pct <= max_take_profit_pct, otherwise the
+    # validation at _validate_args will crash the trader. The RR floor guard
+    # can push min_tp above max_tp when tightening reduced max_tp first.
+    if dynamic_exit_min_take_profit_pct > dynamic_exit_max_take_profit_pct:
+        dynamic_exit_min_take_profit_pct = dynamic_exit_max_take_profit_pct
+        reasons.append("dynamic_take_profit_range_clamped")
         
     # Enforce dynamic_exit_min_reward_risk floor
     dynamic_exit_min_reward_risk = _decimal(baseline.get("dynamic_exit_min_reward_risk"), default=str(args.dynamic_exit_min_reward_risk))
