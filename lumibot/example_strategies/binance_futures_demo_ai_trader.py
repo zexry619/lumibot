@@ -206,6 +206,9 @@ RUNTIME_CONFIG_HOT_KEYS = {
     "ai_close_min_loss_pct",
     "ai_close_required_reversal_timeframes",
     "ai_close_min_confidence",
+    "fear_greed_guard",
+    "fear_greed_block_buy_max",
+    "fear_greed_block_sell_min",
 }
 LARGE_CAP_USDM_BASES = (
     "BTC",
@@ -6049,6 +6052,69 @@ def _funding_entry_block_reason(exchange, args: argparse.Namespace, symbol: str,
     return None
 
 
+_FEAR_GREED_CACHE: dict[str, Any] = {}
+
+
+def _fetch_fear_greed_index() -> Decimal | None:
+    """Fetch Crypto Fear & Greed Index from alternative.me API.
+
+    Returns 0–100 where 0 = extreme fear, 100 = extreme greed.
+    Cached for 60 minutes (the API updates daily but rate limits are tight).
+    Returns None on failure (soft-fail, does not block trading).
+    """
+    global _FEAR_GREED_CACHE
+    now = time.time()
+    cached = _FEAR_GREED_CACHE.get("value")
+    cached_ts = _FEAR_GREED_CACHE.get("ts", 0)
+    if cached is not None and now - cached_ts < 3600:
+        return cached
+
+    try:
+        req = urllib.request.Request(
+            "https://api.alternative.me/fng/?limit=1",
+            headers={"User-Agent": "LumiBot/4.5"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+        data = payload.get("data", [])
+        if data and isinstance(data, list) and len(data) > 0:
+            value = int(data[0].get("value", 50))
+            value = max(0, min(100, value))
+            _FEAR_GREED_CACHE["value"] = Decimal(str(value))
+            _FEAR_GREED_CACHE["ts"] = now
+            print(f"Fear & Greed Index: {value}")
+            return _FEAR_GREED_CACHE["value"]
+    except Exception as exc:
+        print(f"Fear & Greed fetch failed (non-fatal): {exc}")
+    return cached  # return stale cache if available
+
+
+def _fear_greed_entry_block_reason(
+    fng: Decimal | None,
+    side: str,
+    args: argparse.Namespace,
+) -> str | None:
+    """Block entries when Fear & Greed is at extreme levels.
+
+    Extreme greed (> fear_greed_block_buy_max) blocks BUY; extreme fear
+    (< fear_greed_block_sell_min) blocks SELL. The rationale: entering
+    long when the market is euphoric increases risk of buying the top,
+    and shorting when everyone is terrified risks catching a falling
+    knife (or missing the bounce).
+    """
+    if fng is None:
+        return None
+    if not getattr(args, "fear_greed_guard", False):
+        return None
+    block_buy_max = int(getattr(args, "fear_greed_block_buy_max", 80))
+    block_sell_min = int(getattr(args, "fear_greed_block_sell_min", 20))
+    if side == "buy" and fng >= Decimal(str(block_buy_max)):
+        return f"fear_greed_guard: Greed {fng} >= {block_buy_max}, blocking BUY"
+    if side == "sell" and fng <= Decimal(str(block_sell_min)):
+        return f"fear_greed_guard: Fear {fng} <= {block_sell_min}, blocking SELL"
+    return None
+
+
 def _regime_entry_block_reason(
     regime: MarketRegime,
     atr_pct: Decimal,
@@ -7340,6 +7406,14 @@ def _run_iteration(
         _record_entry_block(state, symbol, "short_disabled", "short entries are disabled")
         return state
 
+    # Fear & Greed Index guard
+    fng = _fetch_fear_greed_index()
+    fng_block = _fear_greed_entry_block_reason(fng, decision.action.lower(), args)
+    if fng_block:
+        print(f"Blocked: {fng_block}.")
+        _record_entry_block(state, symbol, "fear_greed", fng_block)
+        return state
+
     if position:
         print("Blocked: existing position is open. Close it before opening a new one.")
         _record_entry_block(state, symbol, "existing_position", "existing position is open")
@@ -7828,6 +7902,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ai-close-min-loss-pct", type=_nonnegative_decimal, default=Decimal("0.30"), help="Minimum unrealized loss %% before an AI CLOSE is honored without a confirmed reversal.")
     parser.add_argument("--ai-close-required-reversal-timeframes", type=int, default=2, help="Higher timeframes that must trend against the position before an AI CLOSE is honored near breakeven.")
     parser.add_argument("--ai-close-min-confidence", type=_positive_decimal, default=Decimal("0.72"), help="Minimum AI CLOSE confidence to act (A3).")
+    parser.add_argument(
+        "--fear-greed-guard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Block entries based on Crypto Fear & Greed Index extremes.",
+    )
+    parser.add_argument("--fear-greed-block-buy-max", type=int, default=80, help="Block BUY when Fear & Greed >= this (extreme greed). 0 disables.")
+    parser.add_argument("--fear-greed-block-sell-min", type=int, default=20, help="Block SELL when Fear & Greed <= this (extreme fear). 0 disables.")
     parser.add_argument(
         "--ai-entry-plan",
         action=argparse.BooleanOptionalAction,

@@ -35,8 +35,8 @@
     "taker_fee_rate_pct": "0.05",
     "min_reward_to_fee_ratio": "3",
     "max_entry_funding_cost_pct": "0.03",
-    "stop_loss_pct": "0.80",
-    "take_profit_pct": "1.60",
+    "stop_loss_pct": "1.20",
+    "take_profit_pct": "2.40",
     "dynamic_exit_plan": true,
     "dynamic_exit_atr_stop_multiplier": "1.80",
     "dynamic_exit_min_stop_pct": "0.50",
@@ -49,7 +49,7 @@
     "close_on_native_protection_failure": true,
     "symbol_cooldown_minutes": "20",
     "loss_symbol_cooldown_minutes": "60",
-    "max_consecutive_losses": 3,
+    "max_consecutive_losses": 2,
     "loss_pause_minutes": "60",
     "auto_blacklist_loss_count": 2,
     "auto_blacklist_minutes": "360",
@@ -115,6 +115,9 @@
     "ai_close_min_loss_pct": "0.30",
     "ai_close_required_reversal_timeframes": 2,
     "ai_close_min_confidence": "0.72",
+    "fear_greed_guard": true,
+    "fear_greed_block_buy_max": 80,
+    "fear_greed_block_sell_min": 20,
     "lessons_db_path": "data/binance_futures_demo_ai_trader_lessons.db"
   }
 }
