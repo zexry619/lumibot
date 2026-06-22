@@ -6752,7 +6752,11 @@ def _run_iteration(
                         is_partial_tp_hit = True
 
                 if is_partial_tp_hit:
-                    close_amount = _market_amount_step(exchange, symbol, position.amount / Decimal("2"))
+                    market = exchange.markets.get(symbol, {})
+                    step_base = _market_amount_step(market)
+                    close_amount = position.amount / Decimal("2")
+                    if step_base is not None and step_base > 0:
+                        close_amount = (close_amount / step_base).to_integral_value(rounding=ROUND_DOWN) * step_base
                     if close_amount > 0:
                         print(f"PARTIAL_TAKE_PROFIT: executing partial close of {close_amount} shares (50% of {position.amount}).")
                         close_execution = _close_position(exchange, symbol, position, dual_side, args.execute, close_amount=close_amount)
@@ -6942,7 +6946,11 @@ def _run_iteration(
                     is_partial_tp_hit = True
 
             if is_partial_tp_hit:
-                close_amount = _market_amount_step(exchange, symbol, position.amount / Decimal("2"))
+                market = exchange.markets.get(symbol, {})
+                step_base = _market_amount_step(market)
+                close_amount = position.amount / Decimal("2")
+                if step_base is not None and step_base > 0:
+                    close_amount = (close_amount / step_base).to_integral_value(rounding=ROUND_DOWN) * step_base
                 if close_amount > 0:
                     print(f"PARTIAL_TAKE_PROFIT: executing partial close of {close_amount} shares (50% of {position.amount}).")
                     close_execution = _close_position(exchange, symbol, position, dual_side, args.execute, close_amount=close_amount)
