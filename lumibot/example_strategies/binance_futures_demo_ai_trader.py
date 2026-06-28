@@ -209,6 +209,8 @@ RUNTIME_CONFIG_HOT_KEYS = {
     "fear_greed_guard",
     "fear_greed_block_buy_max",
     "fear_greed_block_sell_min",
+    "order_book_imbalance_guard",
+    "order_book_imbalance_threshold",
 }
 LARGE_CAP_USDM_BASES = (
     "BTC",
@@ -1679,15 +1681,35 @@ def _parallel_debate_decision(
     decision.
     """
     attempts = max(1, max_retries + 1)
-    spec = _parse_model_spec(model_chain[0]) if model_chain else _parse_model_spec(DEFAULT_MODEL)
-    display_name = _model_display_name(spec)
+    
+    # Parse all specs from model_chain
+    specs = [_parse_model_spec(m) for m in model_chain] if model_chain else [_parse_model_spec(DEFAULT_MODEL)]
+    
+    # Separate thinking/heavy models from fast models
+    thinking_specs = [s for s in specs if "thinking" in s.model.lower() or "max" in s.model.lower()]
+    fast_specs = [s for s in specs if s not in thinking_specs]
+    
+    # Auto-allocate roles:
+    # Reviewer gets the smartest thinking model if available, otherwise the first model
+    reviewer_spec = thinking_specs[0] if thinking_specs else specs[0]
+    
+    # Analysts (Bull/Bear) get the faster/efficient models first, otherwise fallback to specs
+    available_analysts = fast_specs if fast_specs else specs
+    bull_spec = available_analysts[0]
+    bear_spec = available_analysts[1] if len(available_analysts) > 1 else available_analysts[0]
+    
+    display_names = (
+        f"bull={_model_display_name(bull_spec)}, "
+        f"bear={_model_display_name(bear_spec)}, "
+        f"reviewer={_model_display_name(reviewer_spec)}"
+    )
 
     bull_prompt = _bull_case_prompt(prompt)
     bear_prompt = _bear_case_prompt(prompt)
 
-    def _call(prompt_obj: dict[str, Any], max_tokens: int, label: str = "") -> dict[str, Any]:
+    def _call(spec_obj: AIModelSpec, prompt_obj: dict[str, Any], max_tokens: int, label: str = "") -> dict[str, Any]:
         try:
-            text = _ai_completion_text(spec, prompt_obj, temperature=0.2, max_output_tokens=max_tokens, timeout_seconds=request_timeout_seconds)
+            text = _ai_completion_text(spec_obj, prompt_obj, temperature=0.2, max_output_tokens=max_tokens, timeout_seconds=request_timeout_seconds)
             return json.loads(_strip_json_fence(text))
         except Exception:
             if label == "bull":
@@ -1699,14 +1721,14 @@ def _parallel_debate_decision(
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            print(f"Parallel debate request: model={display_name} attempt={attempt}/{attempts}")
+            print(f"Parallel debate request: models=[{display_names}] attempt={attempt}/{attempts}")
             with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_bull = pool.submit(_call, bull_prompt, 300, "bull")
-                fut_bear = pool.submit(_call, bear_prompt, 300, "bear")
+                fut_bull = pool.submit(_call, bull_spec, bull_prompt, 300, "bull")
+                fut_bear = pool.submit(_call, bear_spec, bear_prompt, 300, "bear")
                 bull_json = fut_bull.result()
                 bear_json = fut_bear.result()
             reviewer_prompt = _reviewer_prompt(prompt, bull_json, bear_json)
-            reviewer_json = _call(reviewer_prompt, 600, "reviewer")
+            reviewer_json = _call(reviewer_spec, reviewer_prompt, 600, "reviewer")
             return _aggregate_debate(bull_json, bear_json, reviewer_json)
         except Exception as exc:
             last_exc = exc
@@ -5978,6 +6000,60 @@ def _order_book_ticker(exchange, symbol: str) -> dict[str, Any] | None:
     }
 
 
+def _order_book_imbalance(
+    exchange,
+    symbol: str,
+    depth: int = 10,
+) -> Decimal | None:
+    """Return order book imbalance: (bid_volume - ask_volume) / (bid_volume + ask_volume).
+
+    Returns -1 to +1 where:
+      +0.50+ = strong buy-side pressure (bid > ask)
+      -0.50- = strong sell-side pressure (ask > bid)
+      ~0.00  = balanced
+    Returns None on failure (soft-fail, does not block trading).
+    """
+    try:
+        ob = exchange.fetch_order_book(symbol, limit=depth)
+    except Exception as exc:
+        print(f"Order book fetch failed for {symbol}: {exc}")
+        return None
+    bids = ob.get("bids") or []
+    asks = ob.get("asks") or []
+    if not bids or not asks:
+        return None
+    bid_vol = sum(b[1] for b in bids if isinstance(b, (list, tuple)) and len(b) > 1)
+    ask_vol = sum(a[1] for a in asks if isinstance(a, (list, tuple)) and len(a) > 1)
+    total = bid_vol + ask_vol
+    if total <= 0:
+        return None
+    return (Decimal(str(bid_vol)) - Decimal(str(ask_vol))) / Decimal(str(total))
+
+
+def _order_book_imbalance_block_reason(
+    imbalance: Decimal | None,
+    side: str,
+    args: argparse.Namespace,
+) -> str | None:
+    """Block entries when order book shows strong directional imbalance.
+
+    If order book shows heavy sell walls (imbalance < -min_imbalance) and we
+    want to BUY, block — the ask wall will suppress price. Conversely, heavy
+    buy walls (imbalance > max_imbalance) and we want to SELL, block — the
+    bid wall will prop price up.
+    """
+    if imbalance is None:
+        return None
+    if not getattr(args, "order_book_imbalance_guard", False):
+        return None
+    min_ob = _decimal(getattr(args, "order_book_imbalance_threshold", "0.50"))
+    if side == "buy" and imbalance < -min_ob:
+        return f"order_book_guard: sell wall dominates (imbalance={imbalance:.2f} < -{min_ob})"
+    if side == "sell" and imbalance > min_ob:
+        return f"order_book_guard: buy wall dominates (imbalance={imbalance:.2f} > {min_ob})"
+    return None
+
+
 def _entry_spread_block_reason(exchange, symbol: str, ticker: dict[str, Any], max_spread_pct: Decimal) -> str | None:
     reason = _spread_entry_block_reason(ticker, max_spread_pct)
     if reason != "spread filter could not read bid/ask":
@@ -7414,6 +7490,13 @@ def _run_iteration(
         _record_entry_block(state, symbol, "fear_greed", fng_block)
         return state
 
+    ob_imb = _order_book_imbalance(exchange, symbol)
+    ob_block = _order_book_imbalance_block_reason(ob_imb, decision.action.lower(), args)
+    if ob_block:
+        print(f"Blocked: {ob_block}.")
+        _record_entry_block(state, symbol, "order_book_imbalance", ob_block)
+        return state
+
     if position:
         print("Blocked: existing position is open. Close it before opening a new one.")
         _record_entry_block(state, symbol, "existing_position", "existing position is open")
@@ -7910,6 +7993,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fear-greed-block-buy-max", type=int, default=80, help="Block BUY when Fear & Greed >= this (extreme greed). 0 disables.")
     parser.add_argument("--fear-greed-block-sell-min", type=int, default=20, help="Block SELL when Fear & Greed <= this (extreme fear). 0 disables.")
+    parser.add_argument(
+        "--order-book-imbalance-guard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Block entries when order book shows a strong directional wall.",
+    )
+    parser.add_argument("--order-book-imbalance-threshold", type=_positive_decimal, default=Decimal("0.50"), help="Min |imbalance| to block entry. 1.0=all walls, 0.0=block everything.")
     parser.add_argument(
         "--ai-entry-plan",
         action=argparse.BooleanOptionalAction,
